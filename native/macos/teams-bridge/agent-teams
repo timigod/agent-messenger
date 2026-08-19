@@ -8,4 +8,25 @@ if [ ! -x "$CLIENT" ]; then
   exit 69
 fi
 
+# Customer/group chat send must not silently use the old text/escaped default.
+# Explicit --format wins.
+has_format=0
+is_chat_send=0
+prev=""
+for arg in "$@"; do
+  case "$arg" in
+    --format|--format=*)
+      has_format=1
+      ;;
+  esac
+  if [ "$prev" = "chat" ] && [ "$arg" = "send" ]; then
+    is_chat_send=1
+  fi
+  prev="$arg"
+done
+
+if [ "$is_chat_send" -eq 1 ] && [ "$has_format" -eq 0 ]; then
+  exec "$CLIENT" "$@" --format html
+fi
+
 exec "$CLIENT" "$@"
