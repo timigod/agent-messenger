@@ -7,8 +7,10 @@ import { Command } from 'commander'
 import { handleError } from '@/shared/utils/error-handler'
 import { formatOutput } from '@/shared/utils/output'
 
+import { buildChatSendPayload } from '../chat-send'
 import { TeamsClient } from '../client'
 import { TeamsCredentialManager } from '../credential-manager'
+import { resolveFormat } from './format'
 
 export async function listAction(options: { pretty?: boolean }): Promise<void> {
   try {
@@ -64,10 +66,13 @@ export async function historyAction(chatId: string, options: { limit?: number; p
     const output = messages.map((msg) => ({
       id: msg.id,
       author: msg.author.displayName,
+      author_id: msg.author.id,
       content: msg.content,
       timestamp: msg.timestamp,
       message_type: msg.message_type,
       image_object_id: msg.image_object_id,
+      html: msg.html,
+      mentions: msg.mentions,
     }))
 
     console.log(formatOutput(output, options.pretty))
@@ -76,8 +81,31 @@ export async function historyAction(chatId: string, options: { limit?: number; p
   }
 }
 
-export async function sendAction(chatId: string, content: string, options: { pretty?: boolean }): Promise<void> {
+export async function sendAction(
+  chatId: string,
+  content: string,
+  options: { pretty?: boolean; image?: string; dryRun?: boolean; format?: string },
+): Promise<void> {
+  const format = resolveFormat(options.format, options.pretty)
+
   try {
+    if (options.dryRun) {
+      console.log(
+        formatOutput(
+          {
+            dry_run: true,
+            chat_id: chatId,
+            content,
+            image_path: options.image,
+            format,
+            body: buildChatSendPayload(content, { format }),
+          },
+          options.pretty,
+        ),
+      )
+      return
+    }
+
     const credManager = new TeamsCredentialManager()
     const cred = await credManager.getTokenWithExpiry()
 
@@ -92,12 +120,16 @@ export async function sendAction(chatId: string, content: string, options: { pre
       accountType: cred.accountType,
       region: cred.region,
     })
-    const message = await client.sendChatMessage(chatId, content)
+    const message = await client.sendChatMessage(chatId, content, {
+      format,
+      ...(options.image ? { imagePath: options.image } : {}),
+    })
 
     const output = {
       id: message.id,
       content: message.content,
       timestamp: message.timestamp,
+      ...(message.image_object_id ? { image_object_id: message.image_object_id } : {}),
     }
 
     console.log(formatOutput(output, options.pretty))
@@ -144,6 +176,53 @@ export async function downloadImageAction(
         options.pretty,
       ),
     )
+  } catch (error) {
+    handleError(error as Error)
+  }
+}
+
+export async function startAction(
+  person: string,
+  options: { pretty?: boolean; dryRun?: boolean },
+): Promise<void> {
+  try {
+    if (options.dryRun) {
+      console.log(
+        formatOutput(
+          {
+            dry_run: true,
+            person,
+          },
+          options.pretty,
+        ),
+      )
+      return
+    }
+
+    const credManager = new TeamsCredentialManager()
+    const cred = await credManager.getTokenWithExpiry()
+
+    if (!cred) {
+      console.log(formatOutput({ error: 'Not authenticated. Run "auth extract" first.' }, options.pretty))
+      process.exit(1)
+    }
+
+    const client = await new TeamsClient().login({
+      token: cred.token,
+      tokenExpiresAt: cred.tokenExpiresAt,
+      accountType: cred.accountType,
+      region: cred.region,
+    })
+    const chat = await client.startOneOnOneChat(person)
+
+    const output = {
+      id: chat.id,
+      conversation_id: chat.id,
+      created: chat.created,
+      person: chat.person,
+    }
+
+    console.log(formatOutput(output, options.pretty))
   } catch (error) {
     handleError(error as Error)
   }
@@ -215,11 +294,22 @@ export const chatCommand = new Command('chat')
   )
   .addCommand(
     new Command('send')
-      .description('Send a message to a chat')
+      .description('Send a message to a chat, optionally with a PNG or JPEG image')
       .argument('<chat-id>', 'Chat ID')
       .argument('<content>', 'Message content')
+      .option('--image <path>', 'Attach a local PNG or JPEG image')
+      .option('--format <format>', 'Message format: text, markdown, or html', 'text')
+      .option('--dry-run', 'Print the planned send without uploading or sending')
       .option('--pretty', 'Pretty print JSON output')
       .action(sendAction),
+  )
+  .addCommand(
+    new Command('start')
+      .description('Start or find a 1:1 chat with a person')
+      .argument('<person>', 'Person MRI or user id (8:orgid:…, 8:live:…, orgid:…, live:…, or GUID)')
+      .option('--dry-run', 'Print the intended person without creating a chat')
+      .option('--pretty', 'Pretty print JSON output')
+      .action(startAction),
   )
   .addCommand(
     new Command('edit')

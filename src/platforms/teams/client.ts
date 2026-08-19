@@ -6,8 +6,10 @@ import { decode as decodeJpeg } from 'jpeg-js'
 import { PNG } from 'pngjs'
 
 import { SUBSTRATE_SEARCH_URL } from './app-config'
+import { buildChatSendPayload } from './chat-send'
 import { TeamsCredentialManager } from './credential-manager'
 import { TeamsTokenProvider } from './token-provider'
+import { parseMentions } from './trouter'
 import type {
   TeamsAccountType,
   TeamsChannel,
@@ -16,8 +18,10 @@ import type {
   TeamsChatType,
   TeamsFile,
   TeamsMessage,
+  TeamsMessageFormat,
   TeamsRegion,
   TeamsSearchResult,
+  TeamsStartedChat,
   TeamsTeam,
   TeamsUser,
 } from './types'
@@ -475,6 +479,11 @@ function escapeHtml(value: string): string {
     .replaceAll("'", '&#39;')
 }
 
+function chatImageUriObject(imageObjectId: string, caption: string): string {
+  const objectUrl = `${AMS_API_BASE}/objects/${imageObjectId}`
+  return `<URIObject type="Picture.1" uri="${objectUrl}" url_thumbnail="${objectUrl}/views/imgt1_anim">${escapeHtml(caption)}</URIObject>`
+}
+
 function withThreadMetadata(message: RawTeamsMessage, rootMessageId?: string): TeamsMessage {
   const { rootMessageId: messageRootMessageId, parentMessageId, ...teamsMessage } = message
   const rawRootMessageId = rootMessageId ?? messageRootMessageId
@@ -503,6 +512,94 @@ function classifyChat(
   if (id === '48:notes' || tp?.threadType === 'streamofnotes') return 'self'
   if (tp?.threadType && tp.threadType !== 'chat') return null
   return tp?.topic ? 'group' : 'oneOnOne'
+}
+
+const PERSON_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+function skypeIdFromToken(token: string): string | undefined {
+  try {
+    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')) as {
+      skypeid?: string
+    }
+    return typeof payload.skypeid === 'string' && payload.skypeid.length > 0 ? payload.skypeid : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function normalizePersonMri(person: string, accountType: TeamsAccountType): string {
+  const raw = person.trim()
+  if (!raw) {
+    throw new TeamsError('Person id is required.', 'invalid_person')
+  }
+  if (raw.includes('@') && !raw.toLowerCase().startsWith('8:') && !raw.toLowerCase().includes('orgid:') && !raw.toLowerCase().includes('live:')) {
+    throw new TeamsError(
+      'Person must be a Teams MRI or user id (8:orgid:…, 8:live:…, orgid:…, live:…, or a GUID), not an email.',
+      'invalid_person',
+    )
+  }
+  const lower = raw.toLowerCase()
+  if (lower.startsWith('8:orgid:') || lower.startsWith('8:live:')) return raw
+  if (lower.startsWith('orgid:') || lower.startsWith('live:')) return `8:${raw}`
+  if (lower.startsWith('.cid.') || lower.startsWith('cid.')) {
+    return `8:live:.cid.${raw.replace(/^\.?cid\./i, '')}`
+  }
+  if (PERSON_UUID.test(raw)) {
+    return accountType === 'personal' ? `8:live:${raw}` : `8:orgid:${raw}`
+  }
+  throw new TeamsError(
+    'Person must be a Teams MRI or user id (8:orgid:…, 8:live:…, orgid:…, live:…, or a GUID).',
+    'invalid_person',
+  )
+}
+
+function personMatchKeys(mri: string): string[] {
+  const keys = new Set<string>()
+  const add = (value: string) => {
+    const trimmed = value.trim().toLowerCase()
+    if (trimmed) keys.add(trimmed)
+  }
+  add(mri)
+  const withoutEight = mri.replace(/^8:/i, '')
+  add(withoutEight)
+  const objectId = withoutEight.replace(/^(orgid:|live:)/i, '')
+  add(objectId)
+  if (objectId.toLowerCase().startsWith('.cid.') || objectId.toLowerCase().startsWith('cid.')) {
+    add(objectId.replace(/^\.?cid\./i, ''))
+  }
+  return [...keys]
+}
+
+function memberId(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.length > 0) return value
+  if (isRecord(value)) return stringFrom(value, ['id', 'Id', 'mri', 'MRI'])
+  return undefined
+}
+
+function conversationMatchesPerson(
+  conversation: { id: string; members?: unknown[]; lastMessageFrom?: string },
+  keys: string[],
+): boolean {
+  const haystacks = [conversation.id, conversation.lastMessageFrom, ...(conversation.members ?? []).map(memberId)]
+  return haystacks.some((haystack) => {
+    if (!haystack) return false
+    const lower = haystack.toLowerCase()
+    return keys.some((key) => key.length >= 8 && lower.includes(key))
+  })
+}
+
+function threadIdFromLocation(location: string | null): string | undefined {
+  if (!location) return undefined
+  try {
+    const path = location.includes('://') ? new URL(location).pathname : location
+    const marker = '/threads/'
+    const index = path.toLowerCase().lastIndexOf(marker)
+    const raw = index === -1 ? path.split('/').filter(Boolean).pop() : path.slice(index + marker.length)
+    if (!raw) return undefined
+    return decodeURIComponent(raw.split('?')[0] ?? '')
+  } catch {
+    return undefined
+  }
 }
 
 export class TeamsClient {
@@ -736,7 +833,20 @@ export class TeamsClient {
         return undefined as T
       }
 
-      return response.json() as Promise<T>
+      const location = response.headers.get('Location')
+      const text = await response.text()
+      if (!text) {
+        const threadId = threadIdFromLocation(location)
+        if (threadId) return { id: threadId } as T
+        return undefined as T
+      }
+      try {
+        return JSON.parse(text) as T
+      } catch {
+        const threadId = threadIdFromLocation(location)
+        if (threadId) return { id: threadId } as T
+        throw new TeamsError('Teams returned a non-JSON response.', 'invalid_response')
+      }
     }
 
     throw new TeamsError('Request failed after retries', 'max_retries')
@@ -894,6 +1004,101 @@ export class TeamsClient {
     return chats
   }
 
+  async startOneOnOneChat(person: string): Promise<TeamsStartedChat> {
+    const personMri = normalizePersonMri(person, this.getAccountType())
+    const keys = personMatchKeys(personMri)
+    const existingId = await this.findExistingOneOnOne(keys)
+    if (existingId) {
+      return { id: existingId, created: false, person: personMri }
+    }
+
+    const selfMri = await this.getSelfMri()
+    const selfKeys = personMatchKeys(selfMri)
+    if (selfKeys.some((key) => keys.includes(key))) {
+      throw new TeamsError('Cannot start a 1:1 chat with the signed-in account.', 'invalid_person')
+    }
+
+    const created = await this.request<{ id?: string; threadId?: string }>('POST', '/threads', {
+      members: [
+        { id: selfMri, role: 'Admin' },
+        { id: personMri, role: 'Admin' },
+      ],
+    })
+    const id = created?.id ?? created?.threadId
+    if (!id) {
+      throw new TeamsError('Thread create did not return a conversation id.', 'thread_id_missing')
+    }
+    return { id, created: true, person: personMri }
+  }
+
+  private async findExistingOneOnOne(keys: string[]): Promise<string | undefined> {
+    interface Conversation {
+      id: string
+      threadProperties?: {
+        topic?: string
+        threadType?: string
+        groupId?: string
+      }
+      lastMessage?: { from?: string }
+      members?: unknown[]
+    }
+    interface ConversationsResponse {
+      conversations: Conversation[]
+    }
+    const data = await this.request<ConversationsResponse>(
+      'GET',
+      '/users/ME/conversations?view=msnp24Equivalent&pageSize=500',
+    )
+    for (const conv of data.conversations ?? []) {
+      if (classifyChat(conv.id, conv.threadProperties) !== 'oneOnOne') continue
+      if (
+        conversationMatchesPerson(
+          { id: conv.id, members: conv.members, lastMessageFrom: conv.lastMessage?.from },
+          keys,
+        )
+      ) {
+        return conv.id
+      }
+    }
+    return undefined
+  }
+
+  private async getSelfMri(): Promise<string> {
+    const fromToken = skypeIdFromToken(this.ensureAuth())
+    if (fromToken) {
+      try {
+        return normalizePersonMri(fromToken, this.getAccountType())
+      } catch {
+        // Fall through to /users/ME/properties.
+      }
+    }
+
+    interface UserProperties {
+      userDetails?: string
+      primaryMemberName?: string
+    }
+    const props = await this.request<UserProperties>('GET', '/users/ME/properties')
+    const candidates = [props.primaryMemberName]
+    if (props.userDetails) {
+      try {
+        const details = JSON.parse(props.userDetails) as JsonRecord
+        const fromDetails = stringFrom(details, ['mri', 'MRI', 'skypeid', 'skypeId', 'cid', 'objectId'])
+        if (fromDetails) candidates.push(fromDetails)
+      } catch {
+        // Ignore malformed userDetails and keep primaryMemberName.
+      }
+    }
+    for (const candidate of candidates) {
+      if (!candidate) continue
+      try {
+        return normalizePersonMri(candidate, this.getAccountType())
+      } catch {
+        // Try the next identity candidate.
+      }
+    }
+    throw new TeamsError('Could not determine the signed-in Teams MRI for 1:1 create.', 'self_mri_missing')
+  }
+
   async getChatMessages(chatId: string, limit: number = 50): Promise<TeamsMessage[]> {
     interface ChatMessage {
       id: string
@@ -904,6 +1109,7 @@ export class TeamsClient {
       originalarrivaltime?: string
       messagetype?: string
       amsreferences?: string[]
+      properties?: unknown
     }
     interface MessagesResponse {
       messages: ChatMessage[]
@@ -929,19 +1135,42 @@ export class TeamsClient {
         timestamp: msg.composetime ?? msg.originalarrivaltime ?? '',
         message_type: msg.messagetype,
         image_object_id: validChatImageObjectId(msg.amsreferences?.[0]) ? msg.amsreferences[0] : undefined,
+        html: msg.content,
+        mentions: parseMentions(msg.properties, msg.content ?? ''),
       }))
   }
 
-  async sendChatMessage(chatId: string, content: string): Promise<TeamsMessage> {
+  async sendChatMessage(
+    chatId: string,
+    content: string,
+    options?: {
+      imagePath?: string
+      format?: TeamsMessageFormat
+      mentions?: { mri: string; displayName: string }[]
+    },
+  ): Promise<TeamsMessage> {
     interface SendResponse {
       OriginalArrivalTime?: number
     }
     const encodedChatId = encodeURIComponent(chatId)
-    const response = await this.request<SendResponse>('POST', `/users/ME/conversations/${encodedChatId}/messages`, {
-      content: escapeHtml(content),
-      messagetype: 'RichText/Html',
-      contenttype: 'text',
-    })
+    const format = options?.format ?? 'text'
+    const imageObjectId = options?.imagePath ? await this.uploadChatImage(options.imagePath) : undefined
+    const response = await this.request<SendResponse>(
+      'POST',
+      `/users/ME/conversations/${encodedChatId}/messages`,
+      imageObjectId
+        ? {
+            content: chatImageUriObject(imageObjectId, content),
+            messagetype: 'RichText/UriObject' as const,
+            contenttype: 'text',
+            amsreferences: [imageObjectId],
+          }
+        : buildChatSendPayload(content, {
+            format,
+            mentions: options?.mentions,
+            accountType: this.getAccountType(),
+          }),
+    )
 
     const arrivalTime = response?.OriginalArrivalTime
     return {
@@ -950,6 +1179,7 @@ export class TeamsClient {
       author: { id: 'ME', displayName: 'Me' },
       content,
       timestamp: arrivalTime ? new Date(arrivalTime).toISOString() : new Date().toISOString(),
+      ...(imageObjectId ? { image_object_id: imageObjectId, message_type: 'RichText/UriObject' } : {}),
     }
   }
 
@@ -999,6 +1229,77 @@ export class TeamsClient {
     } catch (error) {
       if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
         throw new TeamsError('Teams chat image download timed out.', 'chat_image_download_timeout')
+      }
+      throw error
+    }
+  }
+
+  async uploadChatImage(filePath: string): Promise<string> {
+    if (this.isTokenExpired()) {
+      throw new TeamsError('Token has expired. Run "auth extract" to refresh.', 'token_expired')
+    }
+
+    const bytes = await readFile(filePath)
+    if (bytes.length < 1 || bytes.length > MAX_CHAT_IMAGE_BYTES) {
+      throw new TeamsError('Teams chat image must be between 1 byte and 20 MiB.', 'invalid_chat_image_size')
+    }
+    const { contentType } = imageMetadata(bytes)
+    const headers = {
+      Authorization: `skype_token ${this.ensureAuth()}`,
+    }
+    const signal = AbortSignal.timeout(CHAT_IMAGE_DOWNLOAD_TIMEOUT_MS)
+    try {
+      const createResponse = await fetch(`${AMS_API_BASE}/objects`, {
+        method: 'POST',
+        headers: {
+          ...headers,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          type: 'pish/image',
+          permissions: { everyone: ['read'] },
+        }),
+        redirect: 'manual',
+        signal,
+      })
+      if (createResponse.status >= 300 && createResponse.status < 400) {
+        throw new TeamsError('Teams chat image upload refused a redirect.', 'chat_image_redirect_refused')
+      }
+      if (!createResponse.ok) {
+        throw new TeamsError(
+          `Teams chat image upload failed with HTTP ${createResponse.status}.`,
+          `chat_image_upload_${createResponse.status}`,
+        )
+      }
+      const created = (await createResponse.json().catch(() => null)) as { id?: unknown } | null
+      const imageObjectId = created?.id
+      if (!validChatImageObjectId(imageObjectId)) {
+        throw new TeamsError('Teams chat image object ID is invalid.', 'invalid_chat_image_object_id')
+      }
+
+      const putResponse = await fetch(`${AMS_API_BASE}/objects/${imageObjectId}/content/imgpsh`, {
+        method: 'PUT',
+        headers: {
+          ...headers,
+          'Content-Type': contentType,
+        },
+        body: new Uint8Array(bytes),
+        redirect: 'manual',
+        signal,
+      })
+      if (putResponse.status >= 300 && putResponse.status < 400) {
+        throw new TeamsError('Teams chat image upload refused a redirect.', 'chat_image_redirect_refused')
+      }
+      if (!putResponse.ok) {
+        throw new TeamsError(
+          `Teams chat image content upload failed with HTTP ${putResponse.status}.`,
+          `chat_image_upload_${putResponse.status}`,
+        )
+      }
+      return imageObjectId
+    } catch (error) {
+      if (error instanceof DOMException && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
+        throw new TeamsError('Teams chat image upload timed out.', 'chat_image_upload_timeout')
       }
       throw error
     }

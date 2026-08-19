@@ -31,6 +31,8 @@ export interface TeamsMessage {
   is_thread_reply?: boolean
   message_type?: string
   image_object_id?: string
+  html?: string
+  mentions?: TeamsMention[]
 }
 
 export interface TeamsChatImageDownload {
@@ -73,6 +75,12 @@ export interface TeamsChat {
   last_message_at?: string
 }
 
+export interface TeamsStartedChat {
+  id: string
+  created: boolean
+  person: string
+}
+
 export interface TeamsReaction {
   emoji: string
   count: number
@@ -94,6 +102,8 @@ export interface TeamsCredentials {
 }
 
 export type TeamsAccountType = 'work' | 'personal'
+
+export type TeamsMessageFormat = 'text' | 'markdown' | 'html'
 
 export type TeamsRegion = 'amer' | 'emea' | 'apac'
 
@@ -166,6 +176,16 @@ export const TeamsMessageSchema = z.object({
   is_thread_reply: z.boolean().optional(),
   message_type: z.string().optional(),
   image_object_id: z.string().optional(),
+  html: z.string().optional(),
+  mentions: z
+    .array(
+      z.object({
+        id: z.string(),
+        mri: z.string().optional(),
+        displayName: z.string(),
+      }),
+    )
+    .optional(),
 })
 
 export const TeamsSearchResultSchema = z.object({

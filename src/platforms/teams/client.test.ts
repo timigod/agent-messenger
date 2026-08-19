@@ -285,11 +285,15 @@ describe('TeamsClient', () => {
         messages: [
           {
             id: 'm1',
-            content: '<p>Hello</p>',
+            content:
+              '<span itemtype="http://schema.skype.com/Mention" itemscope itemid="0">Alice</span><br/><br/> Hello',
             from: 'host/users/ME/contacts/8:alice',
             imdisplayname: 'Alice',
             composetime: '2024-01-01T00:00:00.000Z',
             messagetype: 'RichText/Html',
+            properties: {
+              mentions: [{ itemid: 0, mri: '8:orgid:aaa', mentionType: 'person', displayName: 'Alice' }],
+            },
           },
           {
             id: 'm2',
@@ -306,7 +310,9 @@ describe('TeamsClient', () => {
 
       expect(messages).toHaveLength(1)
       expect(messages[0].id).toBe('m1')
-      expect(messages[0].content).toBe('Hello')
+      expect(messages[0].content).toBe('Alice Hello')
+      expect(messages[0].html).toContain('<br/><br/>')
+      expect(messages[0].mentions).toEqual([{ id: '0', mri: '8:orgid:aaa', displayName: 'Alice' }])
       expect(messages[0].author.displayName).toBe('Alice')
       expect(messages[0].channel_id).toBe('19:1on1@unq.gbl.spaces')
       expect(fetchCalls[0].url).toBe(
@@ -366,6 +372,7 @@ describe('TeamsClient', () => {
       const message = await client.sendChatMessage('19:1on1@unq.gbl.spaces', 'a <b> & c')
 
       expect(message.content).toBe('a <b> & c')
+      expect(message.image_object_id).toBeUndefined()
       expect(fetchCalls[0].url).toBe(
         'https://msgapi.teams.live.com/v1/users/ME/conversations/19%3A1on1%40unq.gbl.spaces/messages',
       )
@@ -377,6 +384,87 @@ describe('TeamsClient', () => {
           contenttype: 'text',
         }),
       )
+    })
+
+    it('sends html format without escaping mention tags', async () => {
+      mockResponse({ OriginalArrivalTime: 1704067200000 })
+
+      const client = await new TeamsClient().login({ token: 'test-token', accountType: 'personal' })
+      const html = 'Hey <at id="8:orgid:c281778c-e71c-415a-8625-ab1f85b9eda9">Grace Hardy</at>'
+      await client.sendChatMessage('19:1on1@unq.gbl.spaces', html, { format: 'html' })
+
+      expect(JSON.parse(String(fetchCalls[0].options?.body))).toEqual({
+        content:
+          'Hey <span itemtype="http://schema.skype.com/Mention" itemscope itemid="0">Grace Hardy</span>',
+        messagetype: 'RichText/Html',
+        contenttype: 'text',
+        properties: {
+          mentions: JSON.stringify([
+            {
+              itemid: 0,
+              mri: '8:orgid:c281778c-e71c-415a-8625-ab1f85b9eda9',
+              mentionType: 'person',
+              displayName: 'Grace Hardy',
+            },
+          ]),
+        },
+      })
+    })
+
+    it('converts html newlines to br and attaches mention properties', async () => {
+      mockResponse({ OriginalArrivalTime: 1704067200000 })
+
+      const client = await new TeamsClient().login({ token: 'test-token', accountType: 'personal' })
+      const html = 'Hey <at id="8:orgid:c281778c-e71c-415a-8625-ab1f85b9eda9">Grace Hardy</at>\n\nSecond paragraph.'
+      await client.sendChatMessage('19:1on1@unq.gbl.spaces', html, { format: 'html' })
+
+      const body = JSON.parse(String(fetchCalls[0].options?.body))
+      expect(body.content).toContain('<br/><br/>')
+      expect(body.content).toContain('itemid="0"')
+      expect(body.properties.mentions).toContain('8:orgid:c281778c-e71c-415a-8625-ab1f85b9eda9')
+    })
+
+    it('converts text paragraph breaks to br tags', async () => {
+      mockResponse({ OriginalArrivalTime: 1704067200000 })
+
+      const client = await new TeamsClient().login({ token: 'test-token', accountType: 'personal' })
+      await client.sendChatMessage('19:1on1@unq.gbl.spaces', 'one\n\ntwo')
+
+      expect(JSON.parse(String(fetchCalls[0].options?.body))).toEqual({
+        content: 'one<br/><br/>two',
+        messagetype: 'RichText/Html',
+        contenttype: 'text',
+      })
+    })
+
+    it('uploads a chat image and sends it as RichText/UriObject', async () => {
+      const png = pngFixture(2, 2)
+      const tempFile = '/tmp/test-teams-chat-image.png'
+      await Bun.write(tempFile, png)
+      mockResponse({ id: '0-frca-d16-upload' })
+      fetchResponses.push(new Response(null, { status: 201 }))
+      mockResponse({ OriginalArrivalTime: 1704067200000 })
+
+      const client = await new TeamsClient().login({ token: 'test-token', accountType: 'personal' })
+      const message = await client.sendChatMessage('19:1on1@unq.gbl.spaces', 'a <b> & c', {
+        imagePath: tempFile,
+      })
+
+      expect(message.image_object_id).toBe('0-frca-d16-upload')
+      expect(message.content).toBe('a <b> & c')
+      expect(fetchCalls).toHaveLength(3)
+      expect(fetchCalls[0].url).toBe('https://api.asm.skype.com/v1/objects')
+      expect(fetchCalls[1].url).toBe('https://api.asm.skype.com/v1/objects/0-frca-d16-upload/content/imgpsh')
+      expect(fetchCalls[2].url).toBe(
+        'https://msgapi.teams.live.com/v1/users/ME/conversations/19%3A1on1%40unq.gbl.spaces/messages',
+      )
+      expect(JSON.parse(String(fetchCalls[2].options?.body))).toEqual({
+        content:
+          '<URIObject type="Picture.1" uri="https://api.asm.skype.com/v1/objects/0-frca-d16-upload" url_thumbnail="https://api.asm.skype.com/v1/objects/0-frca-d16-upload/views/imgt1_anim">a &lt;b&gt; &amp; c</URIObject>',
+        messagetype: 'RichText/UriObject',
+        contenttype: 'text',
+        amsreferences: ['0-frca-d16-upload'],
+      })
     })
   })
 
@@ -553,6 +641,90 @@ describe('TeamsClient', () => {
       })
       await expect(client.downloadChatImage('0-frca-d16-mismatch')).rejects.toMatchObject({
         code: 'chat_image_type_mismatch',
+      })
+    })
+  })
+
+  describe('uploadChatImage', () => {
+    it('creates an AMS object and PUTs PNG bytes without printing the token', async () => {
+      const png = pngFixture(2, 2)
+      const tempFile = '/tmp/test-teams-chat-image.png'
+      await Bun.write(tempFile, png)
+      mockResponse({ id: '0-frca-d16-upload' })
+      fetchResponses.push(new Response(null, { status: 201 }))
+
+      const logs: string[] = []
+      const originalLog = console.log
+      const originalError = console.error
+      console.log = (...args: unknown[]) => {
+        logs.push(args.map(String).join(' '))
+      }
+      console.error = (...args: unknown[]) => {
+        logs.push(args.map(String).join(' '))
+      }
+      try {
+        const client = await new TeamsClient().login({ token: 'test-token', accountType: 'personal' })
+        const id = await client.uploadChatImage(tempFile)
+        expect(id).toBe('0-frca-d16-upload')
+      } finally {
+        console.log = originalLog
+        console.error = originalError
+      }
+
+      expect(logs.join('\n')).not.toContain('test-token')
+      expect(fetchCalls[0].url).toBe('https://api.asm.skype.com/v1/objects')
+      expect(fetchCalls[0].options?.method).toBe('POST')
+      expect(fetchCalls[0].options?.redirect).toBe('manual')
+      expect(headerValue(fetchCalls[0].options, 'Authorization')).toBe('skype_token test-token')
+      expect(fetchCalls[0].options?.body).toBe(
+        JSON.stringify({
+          type: 'pish/image',
+          permissions: { everyone: ['read'] },
+        }),
+      )
+      expect(fetchCalls[1].url).toBe('https://api.asm.skype.com/v1/objects/0-frca-d16-upload/content/imgpsh')
+      expect(fetchCalls[1].options?.method).toBe('PUT')
+      expect(headerValue(fetchCalls[1].options, 'Authorization')).toBe('skype_token test-token')
+      expect(headerValue(fetchCalls[1].options, 'Content-Type')).toBe('image/png')
+      expect(Buffer.from(fetchCalls[1].options?.body as Uint8Array)).toEqual(png)
+    })
+
+    it('rejects empty files, invalid signatures, and untrusted object IDs before sending bytes', async () => {
+      const emptyFile = '/tmp/test-teams-chat-image.png'
+      await Bun.write(emptyFile, '')
+      const client = await new TeamsClient().login({ token: 'test-token', accountType: 'personal' })
+      await expect(client.uploadChatImage(emptyFile)).rejects.toMatchObject({
+        code: 'invalid_chat_image_size',
+      })
+
+      await Bun.write(emptyFile, 'not-an-image')
+      await expect(client.uploadChatImage(emptyFile)).rejects.toMatchObject({
+        code: 'invalid_chat_image_signature',
+      })
+      expect(fetchCalls).toHaveLength(0)
+
+      const png = pngFixture(1, 1)
+      await Bun.write(emptyFile, png)
+      mockResponse({ id: '../outside' })
+      await expect(client.uploadChatImage(emptyFile)).rejects.toMatchObject({
+        code: 'invalid_chat_image_object_id',
+      })
+      expect(fetchCalls).toHaveLength(1)
+    })
+
+    it('maps upload timeouts and refused redirects', async () => {
+      const png = pngFixture(1, 1)
+      const tempFile = '/tmp/test-teams-chat-image.png'
+      await Bun.write(tempFile, png)
+      fetchResponses.push(new DOMException('timed out', 'TimeoutError'))
+      const client = await new TeamsClient().login({ token: 'test-token', accountType: 'personal' })
+      await expect(client.uploadChatImage(tempFile)).rejects.toMatchObject({
+        code: 'chat_image_upload_timeout',
+      })
+
+      fetchResponses.push(new Response(null, { status: 302, headers: { Location: 'https://example.com' } }))
+      await expect(client.uploadChatImage(tempFile)).rejects.toMatchObject({
+        code: 'chat_image_redirect_refused',
       })
     })
   })
@@ -1164,6 +1336,126 @@ describe('TeamsClient', () => {
       await client.getMessages('team2', 'ch2')
 
       expect(fetchCalls.length).toBe(2)
+    })
+  })
+
+  describe('startOneOnOneChat', () => {
+    const personGuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+    const selfGuid = '963d98fa-49d7-4592-a0d9-73df250557f0'
+    const existingId = `19:${personGuid}_${selfGuid}@unq.gbl.spaces`
+    const createdId = '19:new-one-to-one@unq.gbl.spaces'
+
+    it('returns an existing 1:1 whose conversation id contains the person id', async () => {
+      mockResponse({
+        conversations: [
+          { id: '19:group@thread.tacv2', threadProperties: { topic: 'Group Chat', threadType: 'chat' } },
+          { id: existingId, lastMessage: { content: 'Hi' } },
+        ],
+      })
+
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      const chat = await client.startOneOnOneChat(`8:orgid:${personGuid}`)
+
+      expect(chat).toEqual({ id: existingId, created: false, person: `8:orgid:${personGuid}` })
+      expect(fetchCalls).toHaveLength(1)
+      expect(fetchCalls[0].url).toContain('/users/ME/conversations')
+      expect(fetchCalls.some((call) => String(call.url).includes('/v1/threads') && call.options?.method === 'POST')).toBe(
+        false,
+      )
+    })
+
+    it('returns an existing 1:1 whose members include the person', async () => {
+      mockResponse({
+        conversations: [
+          {
+            id: '19:opaque-one-on-one@unq.gbl.spaces',
+            members: [{ id: `8:orgid:${personGuid}` }, { id: `8:orgid:${selfGuid}` }],
+          },
+        ],
+      })
+
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      const chat = await client.startOneOnOneChat(`orgid:${personGuid}`)
+
+      expect(chat).toEqual({
+        id: '19:opaque-one-on-one@unq.gbl.spaces',
+        created: false,
+        person: `8:orgid:${personGuid}`,
+      })
+      expect(fetchCalls).toHaveLength(1)
+    })
+
+    it('creates a 1:1 via POST /v1/threads when none exists', async () => {
+      mockResponse({ conversations: [{ id: '19:group@thread.tacv2', threadProperties: { topic: 'Group' } }] })
+      mockResponse({ primaryMemberName: `8:orgid:${selfGuid}` })
+      mockResponse({ id: createdId })
+
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      const chat = await client.startOneOnOneChat(personGuid)
+
+      expect(chat).toEqual({ id: createdId, created: true, person: `8:orgid:${personGuid}` })
+      expect(fetchCalls).toHaveLength(3)
+      expect(fetchCalls[0].url).toBe(
+        'https://emea.ng.msg.teams.microsoft.com/v1/users/ME/conversations?view=msnp24Equivalent&pageSize=500',
+      )
+      expect(fetchCalls[1].url).toBe('https://emea.ng.msg.teams.microsoft.com/v1/users/ME/properties')
+      expect(fetchCalls[2].url).toBe('https://emea.ng.msg.teams.microsoft.com/v1/threads')
+      expect(fetchCalls[2].options?.method).toBe('POST')
+      expect(JSON.parse(String(fetchCalls[2].options?.body))).toEqual({
+        members: [
+          { id: `8:orgid:${selfGuid}`, role: 'Admin' },
+          { id: `8:orgid:${personGuid}`, role: 'Admin' },
+        ],
+      })
+      expect(fetchCalls.every((call) => !String(call.url).includes('/csa/'))).toBe(true)
+      expect(fetchCalls.every((call) => !String(call.url).includes('graph.microsoft.com'))).toBe(true)
+    })
+
+    it('reads the new conversation id from the Location header when the body is empty', async () => {
+      mockResponse({ conversations: [] })
+      mockResponse({ primaryMemberName: `8:orgid:${selfGuid}` })
+      fetchResponses.push(
+        new Response(null, {
+          status: 201,
+          headers: {
+            Location: `/v1/threads/${encodeURIComponent(createdId)}`,
+            'X-RateLimit-Remaining': '10',
+            'X-RateLimit-Reset': String(Date.now() / 1000 + 60),
+          },
+        }),
+      )
+
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      const chat = await client.startOneOnOneChat(`8:orgid:${personGuid}`)
+
+      expect(chat.id).toBe(createdId)
+      expect(chat.created).toBe(true)
+    })
+
+    it('creates a personal 1:1 with 8:live: members on the consumer host', async () => {
+      const livePerson = 'live:.cid.ba81020167047ec2'
+      const liveSelf = '8:live:.cid.1111111111111111'
+      mockResponse({ conversations: [] })
+      mockResponse({ primaryMemberName: liveSelf })
+      mockResponse({ id: '19:personal-1on1@unq.gbl.spaces' })
+
+      const client = await new TeamsClient().login({ token: 'test-token', accountType: 'personal' })
+      const chat = await client.startOneOnOneChat(livePerson)
+
+      expect(chat.person).toBe('8:live:.cid.ba81020167047ec2')
+      expect(fetchCalls[2].url).toBe('https://msgapi.teams.live.com/v1/threads')
+      expect(JSON.parse(String(fetchCalls[2].options?.body))).toEqual({
+        members: [
+          { id: liveSelf, role: 'Admin' },
+          { id: '8:live:.cid.ba81020167047ec2', role: 'Admin' },
+        ],
+      })
+    })
+
+    it('rejects an email instead of inventing a people-search call', async () => {
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      await expect(client.startOneOnOneChat('grace@hardy.example')).rejects.toThrow(TeamsError)
+      expect(fetchCalls).toHaveLength(0)
     })
   })
 })
