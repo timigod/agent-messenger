@@ -18,6 +18,8 @@ IDENTITY=${TEAMS_BRIDGE_SIGNING_IDENTITY:-Developer ID Application: Build Contex
 BUN_VERSION=1.3.14
 BUN_ARM64_SHA256=e0c90ec15d33363e6b70713d56bc3b2c7585c17f40a0fe0f8fd9305901d4e233
 BUN_ARM64_TARBALL_SHA512=3a68f6d12ba21c13948d4048caab643634942233ad10e27099b8b1fd9c851f805a43a3994da6915884784e31d5cf4c9a7478258ba94b4e2021d6e6ab9ef0f8f4
+MACOS_DEPLOYMENT_TARGET=14.0
+SWIFT_TARGET=arm64-apple-macosx$MACOS_DEPLOYMENT_TARGET
 
 expected_version=$(node -p "require('$ROOT/package.json').version")
 if [ ! -d "$ROOT/node_modules" ]; then
@@ -86,10 +88,10 @@ printf '{"agent_messenger_version":"%s","source_commit":"%s","content_sha256":"%
 chmod 644 "$RESOURCES/runtime-manifest.json"
 
 xcrun swiftc -O -framework AppKit -framework Security -lsqlite3 \
-  "$SOURCE_ROOT/AgentMessengerTeamsBridge.swift" -o "$APP_EXECUTABLE"
-xcrun swiftc -O -framework Foundation \
+  -target "$SWIFT_TARGET" "$SOURCE_ROOT/AgentMessengerTeamsBridge.swift" -o "$APP_EXECUTABLE"
+xcrun swiftc -O -target "$SWIFT_TARGET" -framework Foundation \
   "$SOURCE_ROOT/AgentMessengerTeamsBridgeClient.swift" -o "$CLIENT"
-xcrun clang -O2 "$SOURCE_ROOT/TeamsBridgeRuntimeLauncher.c" -o "$RESOURCES/runtime/launcher"
+xcrun clang -O2 -mmacosx-version-min="$MACOS_DEPLOYMENT_TARGET" "$SOURCE_ROOT/TeamsBridgeRuntimeLauncher.c" -o "$RESOURCES/runtime/launcher"
 
 codesign --force --options runtime --timestamp --sign "$IDENTITY" \
   --entitlements "$SOURCE_ROOT/TeamsBridgeRuntime.entitlements" \

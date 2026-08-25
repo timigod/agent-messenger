@@ -1406,6 +1406,11 @@ describe('TeamsClient', () => {
           { id: `8:orgid:${selfGuid}`, role: 'Admin' },
           { id: `8:orgid:${personGuid}`, role: 'Admin' },
         ],
+        properties: {
+          threadType: 'chat',
+          fixedRoster: 'true',
+          uniquerosterthread: 'true',
+        },
       })
       expect(fetchCalls.every((call) => !String(call.url).includes('/csa/'))).toBe(true)
       expect(fetchCalls.every((call) => !String(call.url).includes('graph.microsoft.com'))).toBe(true)
@@ -1432,6 +1437,26 @@ describe('TeamsClient', () => {
       expect(chat.created).toBe(true)
     })
 
+    it('uses the deterministic org 1:1 id when a successful create omits its body and Location header', async () => {
+      mockResponse({ conversations: [] })
+      mockResponse({ primaryMemberName: `8:orgid:${selfGuid}` })
+      fetchResponses.push(
+        new Response(null, {
+          status: 201,
+          headers: {
+            'X-RateLimit-Remaining': '10',
+            'X-RateLimit-Reset': String(Date.now() / 1000 + 60),
+          },
+        }),
+      )
+
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      const chat = await client.startOneOnOneChat(`8:orgid:${personGuid}`)
+
+      expect(chat.id).toBe(`19:${selfGuid}_${personGuid}@unq.gbl.spaces`)
+      expect(chat.created).toBe(true)
+    })
+
     it('creates a personal 1:1 with 8:live: members on the consumer host', async () => {
       const livePerson = 'live:.cid.ba81020167047ec2'
       const liveSelf = '8:live:.cid.1111111111111111'
@@ -1449,6 +1474,11 @@ describe('TeamsClient', () => {
           { id: liveSelf, role: 'Admin' },
           { id: '8:live:.cid.ba81020167047ec2', role: 'Admin' },
         ],
+        properties: {
+          threadType: 'chat',
+          fixedRoster: 'true',
+          uniquerosterthread: 'true',
+        },
       })
     })
 

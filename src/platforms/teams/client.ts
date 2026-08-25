@@ -602,6 +602,12 @@ function threadIdFromLocation(location: string | null): string | undefined {
   }
 }
 
+function deterministicOrgOneOnOneId(...mris: string[]): string | undefined {
+  const ids = mris.map((mri) => /^8:orgid:([0-9a-f-]{36})$/i.exec(mri)?.[1]?.toLowerCase())
+  if (ids.some((id) => !id)) return undefined
+  return `19:${(ids as string[]).sort().join('_')}@unq.gbl.spaces`
+}
+
 export class TeamsClient {
   private token: string | null = null
   private tokenExpiresAt?: Date
@@ -1023,8 +1029,13 @@ export class TeamsClient {
         { id: selfMri, role: 'Admin' },
         { id: personMri, role: 'Admin' },
       ],
+      properties: {
+        threadType: 'chat',
+        fixedRoster: 'true',
+        uniquerosterthread: 'true',
+      },
     })
-    const id = created?.id ?? created?.threadId
+    const id = created?.id ?? created?.threadId ?? deterministicOrgOneOnOneId(selfMri, personMri)
     if (!id) {
       throw new TeamsError('Thread create did not return a conversation id.', 'thread_id_missing')
     }
