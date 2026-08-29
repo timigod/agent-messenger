@@ -314,6 +314,21 @@ export class TeamsTokenExtractor {
     const candidatePaths =
       this.tokenSource === 'desktop' ? desktopPaths : [...desktopPaths, ...this.getBrowserCookiesPaths()]
 
+    if (accountType !== undefined) {
+      const knownCandidate = await this.selectNewestAuthToken(candidatePaths.filter((p) => p.accountTypeKnown))
+      if (knownCandidate) return knownCandidate.bearer
+
+      // Unknown-account databases are only a fallback: they cannot override a
+      // valid candidate from the requested account's known desktop profile.
+      const unknownCandidate = await this.selectNewestAuthToken(candidatePaths.filter((p) => !p.accountTypeKnown))
+      return unknownCandidate?.bearer ?? null
+    }
+
+    const newestCandidate = await this.selectNewestAuthToken(candidatePaths)
+    return newestCandidate?.bearer ?? null
+  }
+
+  private async selectNewestAuthToken(candidatePaths: TeamsCookiePath[]): Promise<AuthTokenCandidate | null> {
     let newestCandidate: AuthTokenCandidate | null = null
 
     for (const { path: dbPath } of candidatePaths) {
@@ -329,7 +344,7 @@ export class TeamsTokenExtractor {
       }
     }
 
-    return newestCandidate?.bearer ?? null
+    return newestCandidate
   }
 
   private async extractAuthTokenFromSQLite(dbPath: string): Promise<AuthTokenCandidate[]> {

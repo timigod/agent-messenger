@@ -888,6 +888,39 @@ describe('TeamsTokenExtractor', () => {
       rmSync(root, { recursive: true, force: true })
     })
 
+    it('uses an unknown Default database only when no valid requested personal candidate exists', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-unknown-fallback-'))
+      const personalProfile = join(root, 'WV2Profile_tfl')
+      const unknownProfile = join(root, 'Default')
+      mkdirSync(personalProfile, { recursive: true })
+      mkdirSync(unknownProfile, { recursive: true })
+      for (const [dbPath, token, lastAccessUtc] of [
+        [join(personalProfile, 'Cookies'), 'personal'.repeat(10), 200],
+        [join(unknownProfile, 'Cookies'), 'unknown'.repeat(10), 300],
+      ] as const) {
+        const db = new Database(dbPath)
+        db.exec(
+          'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+        )
+        db.prepare(
+          'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+        ).run('authtoken', `Bearer=${token}`, Buffer.alloc(0), 'teams.live.com', lastAccessUtc)
+        db.close()
+      }
+
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
+
+      expect(token).toBe('personal'.repeat(10))
+      rmSync(root, { recursive: true, force: true })
+    })
+
     it('skips malformed authtokens and uses stable non-secret tie-breaking', async () => {
       const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-tie-'))
       const dbPath = join(root, 'Cookies')
