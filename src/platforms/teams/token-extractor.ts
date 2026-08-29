@@ -51,6 +51,11 @@ interface TeamsCookiePath {
   accountTypeKnown: boolean
 }
 
+interface AuthTokenCandidate {
+  bearer: string
+  lastAccessUtc: bigint
+}
+
 const TEAMS_PROCESS_NAMES: Record<string, string> = {
   darwin: 'Microsoft Teams',
   win32: 'Teams.exe',
@@ -75,6 +80,9 @@ const TEAMS_HOST_PATTERNS = [
 // with "Bearer=" and URL-encoded.
 const AUTHTOKEN_COOKIE_NAME = 'authtoken'
 const AUTHTOKEN_HOST_PATTERNS = ['teams.live.com', 'teams.microsoft.com']
+// Bound malformed, duplicate, or superseded rows without allowing token bytes
+// to participate in ordering or tie-breaking.
+const MAX_AUTHTOKEN_ROWS_PER_DATABASE = 8
 
 const TEAMS_KEYCHAIN_VARIANTS: KeychainVariant[] = [
   { service: 'Microsoft Teams Safe Storage', account: 'Microsoft Teams' },
@@ -306,36 +314,59 @@ export class TeamsTokenExtractor {
     const candidatePaths =
       this.tokenSource === 'desktop' ? desktopPaths : [...desktopPaths, ...this.getBrowserCookiesPaths()]
 
+    let newestCandidate: AuthTokenCandidate | null = null
+
     for (const { path: dbPath } of candidatePaths) {
       if (!dbPath || !existsSync(dbPath)) continue
 
-      const bearer = await this.extractAuthTokenFromSQLite(dbPath)
-      if (bearer) return bearer
+      const candidates = await this.extractAuthTokenFromSQLite(dbPath)
+      for (const candidate of candidates) {
+        // The SQL row order and candidate-path order are stable tie-breakers.
+        // Keep the earlier candidate when timestamps are equal.
+        if (!newestCandidate || candidate.lastAccessUtc > newestCandidate.lastAccessUtc) {
+          newestCandidate = candidate
+        }
+      }
     }
 
-    return null
+    return newestCandidate?.bearer ?? null
   }
 
-  private async extractAuthTokenFromSQLite(dbPath: string): Promise<string | null> {
+  private async extractAuthTokenFromSQLite(dbPath: string): Promise<AuthTokenCandidate[]> {
     try {
       let localStatePath: string | undefined
       if (this.platform === 'win32') {
         localStatePath = findLocalStatePath(dbPath) ?? undefined
       }
 
-      for (const hostPattern of AUTHTOKEN_HOST_PATTERNS) {
-        const sql = `
-          SELECT value, encrypted_value
-          FROM cookies
-          WHERE name = '${AUTHTOKEN_COOKIE_NAME}'
-          AND host_key LIKE '%${hostPattern}%'
-          ORDER BY last_access_utc DESC
-          LIMIT 1
-        `
+      const hostPredicate = AUTHTOKEN_HOST_PATTERNS.map(() => 'host_key LIKE ?').join(' OR ')
+      const sql = `
+        SELECT value, encrypted_value, CAST(last_access_utc AS TEXT) AS last_access_utc
+        FROM cookies
+        WHERE name = ?
+        AND (${hostPredicate})
+        ORDER BY cookies.last_access_utc DESC, host_key ASC, rowid ASC
+        LIMIT ${MAX_AUTHTOKEN_ROWS_PER_DATABASE + 1}
+      `
+      type CookieRow = {
+        value?: string
+        encrypted_value?: Uint8Array | Buffer
+        last_access_utc?: string | null
+      }
+      const rows = await this.cookieReader.queryAll<CookieRow>(dbPath, sql, [
+        AUTHTOKEN_COOKIE_NAME,
+        ...AUTHTOKEN_HOST_PATTERNS.map((pattern) => `%${pattern}%`),
+      ])
+      if (rows.length > MAX_AUTHTOKEN_ROWS_PER_DATABASE) {
+        this.debug(`    authtoken candidate limit reached; inspecting newest ${MAX_AUTHTOKEN_ROWS_PER_DATABASE} rows`)
+      }
 
-        type CookieRow = { value?: string; encrypted_value?: Uint8Array | Buffer } | null
-        const row = await this.cookieReader.queryFirst<CookieRow>(dbPath, sql)
-        if (!row) continue
+      const candidates: AuthTokenCandidate[] = []
+      for (const row of rows.slice(0, MAX_AUTHTOKEN_ROWS_PER_DATABASE)) {
+        if (!row.last_access_utc || !/^\d+$/.test(row.last_access_utc)) {
+          this.debug(`    rejected authtoken candidate with invalid access timestamp`)
+          continue
+        }
 
         let value = row.value ?? ''
         if ((!value || value.length < 20) && row.encrypted_value && row.encrypted_value.length > 0) {
@@ -345,21 +376,29 @@ export class TeamsTokenExtractor {
         }
 
         const bearer = this.normalizeAuthToken(value)
-        if (bearer) return bearer
+        if (!bearer) {
+          this.debug(`    rejected malformed authtoken candidate`)
+          continue
+        }
+        candidates.push({ bearer, lastAccessUtc: BigInt(row.last_access_utc) })
       }
 
-      return null
+      return candidates
     } catch (error) {
       this.debug(`    authtoken query error: ${(error as Error).message}`)
-      return null
+      return []
     }
   }
 
   private normalizeAuthToken(rawValue: string): string | null {
     if (!rawValue) return null
-    const decoded = decodeURIComponent(rawValue)
-    const token = decoded.replace(/^Bearer=/i, '').trim()
-    return token.length > 20 ? token : null
+    try {
+      const decoded = decodeURIComponent(rawValue)
+      const token = decoded.replace(/^Bearer=/i, '').trim()
+      return token.length > 20 ? token : null
+    } catch {
+      return null
+    }
   }
 
   async clearKeyCache(): Promise<void> {

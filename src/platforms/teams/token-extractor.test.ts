@@ -4,6 +4,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
 
+import { DerivedKeyCache } from '@/shared/utils/derived-key-cache'
+
 import { TeamsTokenExtractor, resolveTeamsTokenSource } from './token-extractor'
 
 describe('TeamsTokenExtractor', () => {
@@ -794,9 +796,10 @@ describe('TeamsTokenExtractor', () => {
   })
 
   describe('SQLite extraction', () => {
-    it('selects the most recently accessed authtoken row deterministically', async () => {
-      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-order-'))
-      const dbPath = join(root, 'Cookies')
+    it('selects a newer teams.microsoft.com authtoken over an older teams.live.com row', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-host-order-'))
+      const dbPath = join(root, 'WV2Profile_tfl', 'Cookies')
+      mkdirSync(join(root, 'WV2Profile_tfl'), { recursive: true })
       const db = new Database(dbPath)
       db.exec(
         'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
@@ -805,12 +808,139 @@ describe('TeamsTokenExtractor', () => {
         'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
       )
       insert.run('authtoken', `Bearer=${'old'.repeat(20)}`, Buffer.alloc(0), 'teams.live.com', 100)
-      insert.run('authtoken', `Bearer=${'new'.repeat(20)}`, Buffer.alloc(0), 'teams.live.com', 200)
+      insert.run('authtoken', `Bearer=${'new'.repeat(20)}`, Buffer.alloc(0), 'teams.microsoft.com', 200)
       db.close()
 
-      const token = await (new TeamsTokenExtractor('darwin') as any).extractAuthTokenFromSQLite(dbPath)
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
 
       expect(token).toBe('new'.repeat(20))
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('selects a newer Network/Cookies authtoken over an older Cookies database row', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-database-order-'))
+      const profileRoot = join(root, 'WV2Profile_tfl')
+      mkdirSync(join(profileRoot, 'Network'), { recursive: true })
+      for (const [dbPath, token, lastAccessUtc] of [
+        [join(profileRoot, 'Cookies'), 'old'.repeat(20), 13_000_000_000_000_000n],
+        [join(profileRoot, 'Network', 'Cookies'), 'new'.repeat(20), 13_000_000_000_000_001n],
+      ] as const) {
+        const db = new Database(dbPath)
+        db.exec(
+          'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+        )
+        db.prepare(
+          'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+        ).run('authtoken', `Bearer=${token}`, Buffer.alloc(0), 'teams.live.com', lastAccessUtc)
+        db.close()
+      }
+
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
+
+      expect(token).toBe('new'.repeat(20))
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('does not let a newer known work profile authtoken override a requested personal account', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-account-filter-'))
+      const workProfile = join(root, 'WV2Profile_tfw')
+      const personalProfile = join(root, 'WV2Profile_tfl')
+      mkdirSync(workProfile, { recursive: true })
+      mkdirSync(personalProfile, { recursive: true })
+      for (const [dbPath, token, lastAccessUtc] of [
+        [join(workProfile, 'Cookies'), 'work'.repeat(20), 300],
+        [join(personalProfile, 'Cookies'), 'personal'.repeat(10), 200],
+      ] as const) {
+        const db = new Database(dbPath)
+        db.exec(
+          'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+        )
+        db.prepare(
+          'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+        ).run('authtoken', `Bearer=${token}`, Buffer.alloc(0), 'teams.live.com', lastAccessUtc)
+        db.close()
+      }
+
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
+
+      expect(token).toBe('personal'.repeat(10))
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('skips malformed authtokens and uses stable non-secret tie-breaking', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-tie-'))
+      const dbPath = join(root, 'Cookies')
+      const db = new Database(dbPath)
+      db.exec(
+        'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+      )
+      const insert = db.prepare(
+        'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+      )
+      insert.run('authtoken', 'Bearer=%E0%A4%A', Buffer.alloc(0), 'teams.live.com', 300)
+      insert.run('authtoken', `Bearer=${'live'.repeat(20)}`, Buffer.alloc(0), 'teams.live.com', 200)
+      insert.run('authtoken', `Bearer=${'microsoft'.repeat(10)}`, Buffer.alloc(0), 'teams.microsoft.com', 200)
+      db.close()
+
+      const candidates = await (new TeamsTokenExtractor('darwin') as any).extractAuthTokenFromSQLite(dbPath)
+
+      expect(candidates.map((candidate: { bearer: string }) => candidate.bearer)).toEqual([
+        'live'.repeat(20),
+        'microsoft'.repeat(10),
+      ])
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('bounds authtoken candidates and keeps diagnostics secret-free', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-bound-'))
+      const dbPath = join(root, 'Cookies')
+      const db = new Database(dbPath)
+      db.exec(
+        'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+      )
+      const insert = db.prepare(
+        'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+      )
+      for (let index = 0; index < 10; index += 1) {
+        insert.run(
+          'authtoken',
+          `Bearer=candidate_${String(index).padStart(2, '0')}_${'x'.repeat(40)}`,
+          Buffer.alloc(0),
+          index % 2 === 0 ? 'teams.live.com' : 'teams.microsoft.com',
+          1_000 - index,
+        )
+      }
+      db.close()
+
+      const debugLines: string[] = []
+      const candidates = await (
+        new TeamsTokenExtractor('darwin', undefined, (line) => debugLines.push(line)) as any
+      ).extractAuthTokenFromSQLite(dbPath)
+
+      expect(candidates).toHaveLength(8)
+      expect(debugLines).toContain('    authtoken candidate limit reached; inspecting newest 8 rows')
+      expect(debugLines.join('\n')).not.toContain('candidate_')
       rmSync(root, { recursive: true, force: true })
     })
 
