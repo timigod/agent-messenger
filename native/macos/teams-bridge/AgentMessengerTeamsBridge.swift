@@ -490,43 +490,66 @@ private func snapshotSQLiteDatabase(_ source: URL, to destination: URL) throws {
     try ensureDirectory(destination.deletingLastPathComponent())
     try? FileManager.default.removeItem(at: destination)
 
-    var sourceDatabase: OpaquePointer?
-    var destinationDatabase: OpaquePointer?
-    guard sqlite3_open_v2(source.path, &sourceDatabase, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
-          let sourceDatabase else {
-        if let sourceDatabase { sqlite3_close(sourceDatabase) }
-        throw BridgeError.stagingFailed("Unable to open Teams' live cookie database read-only.")
-    }
-    defer { sqlite3_close(sourceDatabase) }
-    guard sqlite3_open_v2(
-        destination.path,
-        &destinationDatabase,
-        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
-        nil
-    ) == SQLITE_OK, let destinationDatabase else {
-        if let destinationDatabase { sqlite3_close(destinationDatabase) }
-        throw BridgeError.stagingFailed("Unable to create the private Teams cookie snapshot.")
-    }
-    defer { sqlite3_close(destinationDatabase) }
-    sqlite3_busy_timeout(sourceDatabase, 2_000)
-    sqlite3_busy_timeout(destinationDatabase, 2_000)
-
-    guard let backup = sqlite3_backup_init(destinationDatabase, "main", sourceDatabase, "main") else {
-        throw BridgeError.stagingFailed("Unable to start a consistent Teams cookie snapshot.")
-    }
-    var result = SQLITE_OK
-    var contentionRetries = 0
-    repeat {
-        result = sqlite3_backup_step(backup, 64)
-        if result == SQLITE_BUSY || result == SQLITE_LOCKED {
-            contentionRetries += 1
-            if contentionRetries > 80 { break }
-            sqlite3_sleep(25)
+    do {
+        var sourceHandle: OpaquePointer?
+        var destinationHandle: OpaquePointer?
+        guard sqlite3_open_v2(source.path, &sourceHandle, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+              let sourceDatabase = sourceHandle else {
+            if let sourceHandle { sqlite3_close(sourceHandle) }
+            throw BridgeError.stagingFailed("Unable to open Teams' live cookie database read-only.")
         }
-    } while result == SQLITE_OK || result == SQLITE_BUSY || result == SQLITE_LOCKED
-    let finishResult = sqlite3_backup_finish(backup)
-    guard result == SQLITE_DONE, finishResult == SQLITE_OK else {
-        throw BridgeError.stagingFailed("Teams' cookie database stayed busy; no inconsistent snapshot was used.")
+        defer { if let sourceHandle { sqlite3_close(sourceHandle) } }
+        guard sqlite3_open_v2(
+            destination.path,
+            &destinationHandle,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+            nil
+        ) == SQLITE_OK, let destinationDatabase = destinationHandle else {
+            if let destinationHandle { sqlite3_close(destinationHandle) }
+            throw BridgeError.stagingFailed("Unable to create the private Teams cookie snapshot.")
+        }
+        defer { if let destinationHandle { sqlite3_close(destinationHandle) } }
+        sqlite3_busy_timeout(sourceDatabase, 2_000)
+        sqlite3_busy_timeout(destinationDatabase, 2_000)
+
+        guard let backup = sqlite3_backup_init(destinationDatabase, "main", sourceDatabase, "main") else {
+            throw BridgeError.stagingFailed("Unable to start a consistent Teams cookie snapshot.")
+        }
+        var result = SQLITE_OK
+        var contentionRetries = 0
+        repeat {
+            result = sqlite3_backup_step(backup, 64)
+            if result == SQLITE_BUSY || result == SQLITE_LOCKED {
+                contentionRetries += 1
+                if contentionRetries > 80 { break }
+                sqlite3_sleep(25)
+            }
+        } while result == SQLITE_OK || result == SQLITE_BUSY || result == SQLITE_LOCKED
+        let finishResult = sqlite3_backup_finish(backup)
+        guard result == SQLITE_DONE, finishResult == SQLITE_OK else {
+            throw BridgeError.stagingFailed("Teams' cookie database stayed busy; no inconsistent snapshot was used.")
+        }
+        guard sqlite3_exec(destinationDatabase, "PRAGMA journal_mode=DELETE", nil, nil, nil) == SQLITE_OK else {
+            throw BridgeError.stagingFailed("Unable to finalize the private Teams cookie snapshot.")
+        }
+        guard sqlite3_close(destinationDatabase) == SQLITE_OK else {
+            throw BridgeError.stagingFailed("Unable to close the private Teams cookie snapshot.")
+        }
+        destinationHandle = nil
+        guard sqlite3_close(sourceDatabase) == SQLITE_OK else {
+            throw BridgeError.stagingFailed("Unable to close Teams' live cookie database snapshot.")
+        }
+        sourceHandle = nil
+    }
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = URL(fileURLWithPath: destination.path + suffix)
+        if FileManager.default.fileExists(atPath: sidecar.path) {
+            do {
+                try FileManager.default.removeItem(at: sidecar)
+            } catch {
+                throw BridgeError.stagingFailed("Unable to remove a private Teams cookie snapshot sidecar.")
+            }
+        }
     }
     guard chmod(destination.path, mode_t(0o600)) == 0 else { throw POSIXError(.EACCES) }
 }
@@ -825,23 +848,32 @@ private func openSelfTestDatabase(_ url: URL, marker: Int32) throws -> OpaquePoi
     return database
 }
 
+private func syntheticSQLiteFailure(_ message: String, database: OpaquePointer?) -> BridgeError {
+    guard let database else { return .runtimeFailed("\(message) (SQLite handle unavailable.)") }
+    return .runtimeFailed(
+        "\(message) (SQLite \(sqlite3_errcode(database))/\(sqlite3_extended_errcode(database)): "
+            + "\(String(cString: sqlite3_errmsg(database))))"
+    )
+}
+
 private func readSelfTestMarker(_ url: URL) throws -> Int32 {
     var database: OpaquePointer?
-    guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
-          let database else {
+    let openResult = sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil)
+    guard openResult == SQLITE_OK, let database else {
+        let error = syntheticSQLiteFailure("Unable to open a staged synthetic Teams database.", database: database)
         if let database { sqlite3_close(database) }
-        throw BridgeError.runtimeFailed("Unable to open a staged synthetic Teams database.")
+        throw error
     }
     defer { sqlite3_close(database) }
     var statement: OpaquePointer?
-    guard sqlite3_prepare_v2(database, "SELECT marker FROM bridge_self_test", -1, &statement, nil) == SQLITE_OK,
-          let statement else {
+    let prepareResult = sqlite3_prepare_v2(database, "SELECT marker FROM bridge_self_test", -1, &statement, nil)
+    guard prepareResult == SQLITE_OK, let statement else {
         if let statement { sqlite3_finalize(statement) }
-        throw BridgeError.runtimeFailed("Unable to inspect a staged synthetic Teams database.")
+        throw syntheticSQLiteFailure("Unable to inspect a staged synthetic Teams database.", database: database)
     }
     defer { sqlite3_finalize(statement) }
     guard sqlite3_step(statement) == SQLITE_ROW else {
-        throw BridgeError.runtimeFailed("The staged synthetic Teams database is empty.")
+        throw syntheticSQLiteFailure("The staged synthetic Teams database is empty.", database: database)
     }
     return sqlite3_column_int(statement, 0)
 }
@@ -916,9 +948,22 @@ private func runSelfTest() throws {
     try snapshotTeamsProfileDatabases(sourceRoot: syntheticSource, destinationRoot: syntheticStage)
     for (relativePath, marker) in stagedDatabases {
         let staged = syntheticStage.appendingPathComponent(relativePath, isDirectory: false)
-        guard FileManager.default.fileExists(atPath: staged.path),
-              try readSelfTestMarker(staged) == marker else {
-            throw BridgeError.invalidRequest("Complete Teams profile staging self-test failed.")
+        guard FileManager.default.fileExists(atPath: staged.path) else {
+            throw BridgeError.invalidRequest("A staged synthetic Teams database is missing.")
+        }
+        let attributes = try FileManager.default.attributesOfItem(atPath: staged.path)
+        guard (attributes[.posixPermissions] as? NSNumber)?.intValue == 0o600 else {
+            throw BridgeError.invalidRequest("A staged synthetic Teams database is not mode 0600.")
+        }
+        let hasWAL = FileManager.default.fileExists(atPath: "\(staged.path)-wal")
+        let hasSHM = FileManager.default.fileExists(atPath: "\(staged.path)-shm")
+        guard !hasWAL, !hasSHM else {
+            throw BridgeError.invalidRequest(
+                "A staged synthetic Teams database retained a SQLite sidecar (WAL: \(hasWAL), SHM: \(hasSHM))."
+            )
+        }
+        guard try readSelfTestMarker(staged) == marker else {
+            throw BridgeError.invalidRequest("A staged synthetic Teams database lost committed WAL state.")
         }
     }
     let upload = BridgeRequest(
