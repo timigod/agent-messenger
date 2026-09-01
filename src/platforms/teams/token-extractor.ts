@@ -152,7 +152,7 @@ export class TeamsTokenExtractor {
             'MSTeams',
             'EBWebView',
           )
-        return [
+        const profilePaths: TeamsCookiePath[] = [
           { path: join(ebWebViewBase, 'WV2Profile_tfw', 'Cookies'), accountType: 'work', accountTypeKnown: true },
           {
             path: join(ebWebViewBase, 'WV2Profile_tfw', 'Network', 'Cookies'),
@@ -171,6 +171,10 @@ export class TeamsTokenExtractor {
           },
           { path: join(ebWebViewBase, 'Default', 'Cookies'), accountType: 'work', accountTypeKnown: false },
           { path: join(ebWebViewBase, 'Default', 'Network', 'Cookies'), accountType: 'work', accountTypeKnown: false },
+        ]
+        if (this.desktopProfileRoot) return profilePaths
+        return [
+          ...profilePaths,
           {
             path: join(homedir(), 'Library', 'Application Support', 'Microsoft', 'Teams', 'Cookies'),
             accountType: 'work',

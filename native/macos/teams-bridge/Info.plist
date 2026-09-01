@@ -23,6 +23,6 @@
   <key>LSUIElement</key>
   <true/>
   <key>NSAppDataUsageDescription</key>
-  <string>Reads the two Microsoft Teams desktop session databases you explicitly select so the local Agent Messenger CLI can use those signed-in accounts.</string>
+  <string>Reads the Microsoft Teams desktop session databases you explicitly select so the local Agent Messenger CLI can use those signed-in accounts.</string>
 </dict>
 </plist>

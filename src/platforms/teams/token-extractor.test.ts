@@ -228,15 +228,26 @@ describe('TeamsTokenExtractor', () => {
       expect(desktopOnly.getTeamsCookiesPaths().some((entry) => entry.path.includes('Google/Chrome'))).toBe(false)
     })
 
-    it('can read a companion-staged Teams desktop profile instead of the protected app container', () => {
+    it('reads every bounded companion-staged Teams database without escaping the staged root', () => {
       const stagedRoot = join(tmpdir(), 'teams-bridge-stage')
       const staged = new TeamsTokenExtractor('darwin', undefined, undefined, undefined, 'desktop', stagedRoot)
 
-      expect(staged.getDesktopCookiesPaths()).toContainEqual({
-        path: join(stagedRoot, 'WV2Profile_tfw', 'Network', 'Cookies'),
-        accountType: 'work',
-        accountTypeKnown: true,
-      })
+      expect(staged.getDesktopCookiesPaths()).toEqual([
+        { path: join(stagedRoot, 'WV2Profile_tfw', 'Cookies'), accountType: 'work', accountTypeKnown: true },
+        {
+          path: join(stagedRoot, 'WV2Profile_tfw', 'Network', 'Cookies'),
+          accountType: 'work',
+          accountTypeKnown: true,
+        },
+        { path: join(stagedRoot, 'WV2Profile_tfl', 'Cookies'), accountType: 'personal', accountTypeKnown: true },
+        {
+          path: join(stagedRoot, 'WV2Profile_tfl', 'Network', 'Cookies'),
+          accountType: 'personal',
+          accountTypeKnown: true,
+        },
+        { path: join(stagedRoot, 'Default', 'Cookies'), accountType: 'work', accountTypeKnown: false },
+        { path: join(stagedRoot, 'Default', 'Network', 'Cookies'), accountType: 'work', accountTypeKnown: false },
+      ])
       expect(staged.getLocalStatePath()).toBe(join(stagedRoot, 'Local State'))
     })
   })
@@ -918,6 +929,39 @@ describe('TeamsTokenExtractor', () => {
       ).extractIdToken('personal')
 
       expect(token).toBe('personal'.repeat(10))
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('reaches a staged Default Network fallback when the requested personal profile has no valid candidate', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-staged-fallback-'))
+      const personalProfile = join(root, 'WV2Profile_tfl')
+      const fallbackProfile = join(root, 'Default', 'Network')
+      mkdirSync(personalProfile, { recursive: true })
+      mkdirSync(fallbackProfile, { recursive: true })
+      for (const [dbPath, value, lastAccessUtc] of [
+        [join(personalProfile, 'Cookies'), 'malformed', 400],
+        [join(fallbackProfile, 'Cookies'), `Bearer=${'fallback'.repeat(10)}`, 300],
+      ] as const) {
+        const db = new Database(dbPath)
+        db.exec(
+          'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+        )
+        db.prepare(
+          'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+        ).run('authtoken', value, Buffer.alloc(0), 'teams.microsoft.com', lastAccessUtc)
+        db.close()
+      }
+
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
+
+      expect(token).toBe('fallback'.repeat(10))
       rmSync(root, { recursive: true, force: true })
     })
 

@@ -7,11 +7,19 @@ describe('Teams macOS operator boundary', () => {
     expect(() => assertTeamsOperatorBoundary('darwin', undefined)).toThrow(TEAMS_COMPANION_REQUIRED)
   })
 
-  it('accepts the signed companion child', () => {
-    expect(() => assertTeamsOperatorBoundary('darwin', '1')).not.toThrow()
+  it('rejects a forged companion environment flag without signed invocation proof', () => {
+    expect(() => assertTeamsOperatorBoundary('darwin', '1', () => false)).toThrow(TEAMS_COMPANION_REQUIRED)
+  })
+
+  it('accepts a signed companion child with both mediated state and invocation proof', () => {
+    expect(() => assertTeamsOperatorBoundary('darwin', '1', () => true)).not.toThrow()
   })
 
   it('leaves the upstream Windows lane unchanged', () => {
-    expect(() => assertTeamsOperatorBoundary('win32', undefined)).not.toThrow()
+    expect(() =>
+      assertTeamsOperatorBoundary('win32', undefined, () => {
+        throw new Error('Windows must not invoke the macOS verifier')
+      }),
+    ).not.toThrow()
   })
 })

@@ -54,7 +54,7 @@ private enum ApprovedFileCommand {
     case output(argumentIndex: Int)
 }
 
-private func approvedFileCommand(_ args: [String]) throws -> ApprovedFileCommand? {
+private func bridgePositionals(_ args: [String]) throws -> [(index: Int, value: String)] {
     var positionals: [(index: Int, value: String)] = []
     var optionsEnded = false
     var index = 0
@@ -86,7 +86,11 @@ private func approvedFileCommand(_ args: [String]) throws -> ApprovedFileCommand
         positionals.append((index, value))
         index += 1
     }
+    return positionals
+}
 
+private func approvedFileCommand(_ args: [String]) throws -> ApprovedFileCommand? {
+    let positionals = try bridgePositionals(args)
     guard positionals.count >= 2 else { return nil }
     let command = positionals[0].value
     let action = positionals[1].value
@@ -293,7 +297,10 @@ private func validatedArgs(_ request: BridgeRequest) throws -> [String] {
     guard request.args.allSatisfy({ $0.utf8.count <= 16_384 && !$0.contains("\0") }) else {
         throw BridgeError.invalidRequest("Invalid Teams bridge argument payload.")
     }
-    if request.args.starts(with: ["auth", "login"]) {
+    let positionals = try bridgePositionals(request.args)
+    let command = positionals.first?.value
+    let action = positionals.dropFirst().first?.value
+    if command == "auth", action == "login" {
         throw BridgeError.invalidRequest("Teams device-code login is disabled; the official desktop app owns sign-in.")
     }
     if request.args.contains("--token") || request.args.contains(where: { $0.hasPrefix("--token=") }) {
@@ -304,14 +311,29 @@ private func validatedArgs(_ request: BridgeRequest) throws -> [String] {
     }
 
     var args = request.args
-    if args.starts(with: ["auth", "extract"]) {
-        if let index = args.firstIndex(of: "--source"), index + 1 < args.count, args[index + 1] != "desktop" {
-            throw BridgeError.invalidRequest("Only the desktop Teams authentication source is allowed.")
+    if command == "auth", action == "extract" {
+        var sourceWasProvided = false
+        var index = 0
+        while index < args.count {
+            let value = args[index]
+            if value == "--" { break }
+            if value == "--source" {
+                guard index + 1 < args.count, args[index + 1] == "desktop" else {
+                    throw BridgeError.invalidRequest("Only the desktop Teams authentication source is allowed.")
+                }
+                sourceWasProvided = true
+                index += 2
+                continue
+            }
+            if value.hasPrefix("--source=") {
+                guard value == "--source=desktop" else {
+                    throw BridgeError.invalidRequest("Only the desktop Teams authentication source is allowed.")
+                }
+                sourceWasProvided = true
+            }
+            index += 1
         }
-        if let inline = args.first(where: { $0.hasPrefix("--source=") }), inline != "--source=desktop" {
-            throw BridgeError.invalidRequest("Only the desktop Teams authentication source is allowed.")
-        }
-        if !args.contains("--source") && !args.contains(where: { $0.hasPrefix("--source=") }) {
+        if !sourceWasProvided {
             args.append(contentsOf: ["--source", "desktop"])
         }
     }
@@ -464,26 +486,6 @@ private func ensureDerivedTeamsKey(configDirectory: URL, forceRefresh: Bool = fa
     throw BridgeError.setupRequired("Microsoft Teams Safe Storage was not found in Keychain.")
 }
 
-private func findCookieDatabase(in profile: URL) throws -> URL {
-    let direct = [profile.appendingPathComponent("Network/Cookies"), profile.appendingPathComponent("Cookies")]
-    if let match = direct.first(where: { FileManager.default.fileExists(atPath: $0.path) }) { return match }
-    guard let enumerator = FileManager.default.enumerator(
-        at: profile,
-        includingPropertiesForKeys: [.isRegularFileKey],
-        options: [.skipsHiddenFiles, .skipsPackageDescendants]
-    ) else {
-        throw BridgeError.stagingFailed("Unable to inspect Teams profile \(profile.lastPathComponent).")
-    }
-    var matches: [URL] = []
-    for case let candidate as URL in enumerator where candidate.lastPathComponent == "Cookies" {
-        if candidate.pathComponents.count - profile.pathComponents.count <= 4 { matches.append(candidate) }
-    }
-    guard let match = matches.sorted(by: { $0.path < $1.path }).first else {
-        throw BridgeError.stagingFailed("No cookie database found for Teams profile \(profile.lastPathComponent).")
-    }
-    return match
-}
-
 private func snapshotSQLiteDatabase(_ source: URL, to destination: URL) throws {
     try ensureDirectory(destination.deletingLastPathComponent())
     try? FileManager.default.removeItem(at: destination)
@@ -529,20 +531,40 @@ private func snapshotSQLiteDatabase(_ source: URL, to destination: URL) throws {
     guard chmod(destination.path, mode_t(0o600)) == 0 else { throw POSIXError(.EACCES) }
 }
 
+private let teamsProfileDatabaseLayout: [(profile: String, required: Bool)] = [
+    ("WV2Profile_tfw", true),
+    ("WV2Profile_tfl", true),
+    ("Default", false),
+]
+
+private let teamsCookieDatabasePaths = ["Cookies", "Network/Cookies"]
+
+private func snapshotTeamsProfileDatabases(sourceRoot: URL, destinationRoot: URL) throws {
+    for entry in teamsProfileDatabaseLayout {
+        var snapshotCount = 0
+        for relativePath in teamsCookieDatabasePaths {
+            let source = sourceRoot
+                .appendingPathComponent(entry.profile, isDirectory: true)
+                .appendingPathComponent(relativePath, isDirectory: false)
+            guard FileManager.default.fileExists(atPath: source.path) else { continue }
+            let destination = destinationRoot
+                .appendingPathComponent(entry.profile, isDirectory: true)
+                .appendingPathComponent(relativePath, isDirectory: false)
+            try snapshotSQLiteDatabase(source, to: destination)
+            snapshotCount += 1
+        }
+        if entry.required, snapshotCount == 0 {
+            throw BridgeError.stagingFailed("No cookie database found for Teams profile \(entry.profile).")
+        }
+    }
+}
+
 private func stageTeamsProfiles(sourceRoot: URL, paths: BridgePaths, requestID: String) throws -> URL {
     let destinationRoot = paths.staging.appendingPathComponent(requestID, isDirectory: true)
     try? FileManager.default.removeItem(at: destinationRoot)
     try ensureDirectory(destinationRoot)
     do {
-        for profileName in ["WV2Profile_tfw", "WV2Profile_tfl"] {
-            let sourceCookies = try findCookieDatabase(
-                in: sourceRoot.appendingPathComponent(profileName, isDirectory: true)
-            )
-            let destinationCookies = destinationRoot
-                .appendingPathComponent(profileName, isDirectory: true)
-                .appendingPathComponent("Network/Cookies")
-            try snapshotSQLiteDatabase(sourceCookies, to: destinationCookies)
-        }
+        try snapshotTeamsProfileDatabases(sourceRoot: sourceRoot, destinationRoot: destinationRoot)
         let localState = sourceRoot.appendingPathComponent("Local State")
         if FileManager.default.fileExists(atPath: localState.path) {
             try writePrivate(try Data(contentsOf: localState), to: destinationRoot.appendingPathComponent("Local State"))
@@ -586,7 +608,6 @@ private func runAgentTeams(
         "NO_COLOR": "1",
         "AGENT_MESSENGER_CONFIG_DIR": configDirectory.path,
         "AGENT_TEAMS_AUTH_SOURCE": "desktop",
-        "AGENT_TEAMS_COMPANION_MEDIATED": "1",
         "AGENT_TEAMS_DESKTOP_PROFILE_ROOT": stagedRoot.path,
         "AGENT_TEAMS_DISABLE_KEYCHAIN_LOOKUP": "1",
     ]
@@ -779,22 +800,127 @@ private final class BridgeDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+private func openSelfTestDatabase(_ url: URL, marker: Int32) throws -> OpaquePointer {
+    try ensureDirectory(url.deletingLastPathComponent())
+    var database: OpaquePointer?
+    guard sqlite3_open_v2(
+        url.path,
+        &database,
+        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX,
+        nil
+    ) == SQLITE_OK, let database else {
+        if let database { sqlite3_close(database) }
+        throw BridgeError.runtimeFailed("Unable to create a synthetic Teams database.")
+    }
+    let statements = [
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA wal_autocheckpoint=0",
+        "CREATE TABLE bridge_self_test (marker INTEGER NOT NULL)",
+        "INSERT INTO bridge_self_test VALUES (\(marker))",
+    ]
+    for statement in statements where sqlite3_exec(database, statement, nil, nil, nil) != SQLITE_OK {
+        sqlite3_close(database)
+        throw BridgeError.runtimeFailed("Unable to populate a synthetic Teams database.")
+    }
+    return database
+}
+
+private func readSelfTestMarker(_ url: URL) throws -> Int32 {
+    var database: OpaquePointer?
+    guard sqlite3_open_v2(url.path, &database, SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX, nil) == SQLITE_OK,
+          let database else {
+        if let database { sqlite3_close(database) }
+        throw BridgeError.runtimeFailed("Unable to open a staged synthetic Teams database.")
+    }
+    defer { sqlite3_close(database) }
+    var statement: OpaquePointer?
+    guard sqlite3_prepare_v2(database, "SELECT marker FROM bridge_self_test", -1, &statement, nil) == SQLITE_OK,
+          let statement else {
+        if let statement { sqlite3_finalize(statement) }
+        throw BridgeError.runtimeFailed("Unable to inspect a staged synthetic Teams database.")
+    }
+    defer { sqlite3_finalize(statement) }
+    guard sqlite3_step(statement) == SQLITE_ROW else {
+        throw BridgeError.runtimeFailed("The staged synthetic Teams database is empty.")
+    }
+    return sqlite3_column_int(statement, 0)
+}
+
+private func rejectsValidatedArgs(_ request: BridgeRequest) -> Bool {
+    do {
+        _ = try validatedArgs(request)
+        return false
+    } catch BridgeError.invalidRequest {
+        return true
+    } catch {
+        return false
+    }
+}
+
 private func runSelfTest() throws {
     let valid = BridgeRequest(version: 1, id: "self-test", args: ["auth", "extract"], profile: "proof", timeout_ms: 5_000, input_files: nil, output_files: nil)
     guard try validatedArgs(valid).suffix(2) == ["--source", "desktop"] else {
         throw BridgeError.invalidRequest("Desktop source injection failed.")
     }
-    let invalid = BridgeRequest(version: 1, id: "self-test", args: ["auth", "login"], profile: "proof", timeout_ms: 5_000, input_files: nil, output_files: nil)
-    do {
-        _ = try validatedArgs(invalid)
-        throw BridgeError.invalidRequest("Device-code guard failed.")
-    } catch BridgeError.invalidRequest {
-        // Expected.
+    let validAuthPermutations = [
+        ["--account", "personal", "auth", "extract"],
+        ["auth", "--team", "team", "extract", "--account=personal"],
+        ["--team=team", "auth", "--account=personal", "extract", "--source=desktop"],
+    ]
+    for args in validAuthPermutations {
+        let request = BridgeRequest(version: 1, id: "self-test", args: args, profile: "proof", timeout_ms: 5_000, input_files: nil, output_files: nil)
+        let normalized = try validatedArgs(request)
+        guard normalized.contains("--source=desktop") || normalized.suffix(2) == ["--source", "desktop"] else {
+            throw BridgeError.invalidRequest("Root-option desktop source normalization failed.")
+        }
+    }
+    let rejectedAuthPermutations = [
+        ["auth", "login"],
+        ["--account", "personal", "auth", "login"],
+        ["auth", "--team=team", "login", "--account=personal"],
+        ["--team", "team", "auth", "--account", "personal", "extract", "--source", "all"],
+        ["auth", "--account=personal", "extract", "--source=browser"],
+        ["--account=personal", "auth", "extract", "--source"],
+        ["--account", "personal", "auth", "extract", "--token=synthetic"],
+        ["auth", "--team=team", "extract", "--browser-profile=Default"],
+    ]
+    for args in rejectedAuthPermutations {
+        let request = BridgeRequest(version: 1, id: "self-test", args: args, profile: "proof", timeout_ms: 5_000, input_files: nil, output_files: nil)
+        guard rejectsValidatedArgs(request) else {
+            throw BridgeError.invalidRequest("Auth argument guard permutation failed.")
+        }
     }
     let testRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("teams-bridge-input-self-test-\(UUID().uuidString)", isDirectory: true)
     defer { try? FileManager.default.removeItem(at: testRoot) }
     try ensureDirectory(testRoot)
+    let syntheticSource = testRoot.appendingPathComponent("profiles", isDirectory: true)
+    let syntheticStage = testRoot.appendingPathComponent("staged", isDirectory: true)
+    let stagedDatabases = [
+        ("WV2Profile_tfw/Cookies", Int32(101)),
+        ("WV2Profile_tfw/Network/Cookies", Int32(102)),
+        ("WV2Profile_tfl/Cookies", Int32(201)),
+        ("WV2Profile_tfl/Network/Cookies", Int32(202)),
+        ("Default/Cookies", Int32(301)),
+        ("Default/Network/Cookies", Int32(302)),
+    ]
+    var syntheticDatabases: [OpaquePointer] = []
+    defer { syntheticDatabases.forEach { sqlite3_close($0) } }
+    for (relativePath, marker) in stagedDatabases {
+        let source = syntheticSource.appendingPathComponent(relativePath, isDirectory: false)
+        syntheticDatabases.append(try openSelfTestDatabase(source, marker: marker))
+        guard FileManager.default.fileExists(atPath: "\(source.path)-wal") else {
+            throw BridgeError.invalidRequest("Synthetic SQLite sidecar setup failed.")
+        }
+    }
+    try snapshotTeamsProfileDatabases(sourceRoot: syntheticSource, destinationRoot: syntheticStage)
+    for (relativePath, marker) in stagedDatabases {
+        let staged = syntheticStage.appendingPathComponent(relativePath, isDirectory: false)
+        guard FileManager.default.fileExists(atPath: staged.path),
+              try readSelfTestMarker(staged) == marker else {
+            throw BridgeError.invalidRequest("Complete Teams profile staging self-test failed.")
+        }
+    }
     let upload = BridgeRequest(
         version: 1,
         id: "self-test",
