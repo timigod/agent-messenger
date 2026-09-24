@@ -602,10 +602,59 @@ function threadIdFromLocation(location: string | null): string | undefined {
   }
 }
 
+function threadIdFromCreateResponse(created: unknown): string | undefined {
+  if (!isRecord(created)) return undefined
+  const direct = stringFrom(created, ['id', 'Id', 'threadId', 'ThreadId', 'conversationId', 'conversationid'])
+  if (direct) return direct
+  const nested = recordFrom(created, ['thread', 'Thread', 'conversation', 'Conversation', 'resource'])
+  if (!nested) return undefined
+  return stringFrom(nested, ['id', 'Id', 'threadId', 'ThreadId'])
+}
+
+interface TeamsRawConversation {
+  id: string
+  threadProperties?: {
+    topic?: string
+    threadType?: string
+    groupId?: string
+  }
+  lastMessage?: { from?: string }
+  members?: unknown[]
+}
+
 function deterministicOrgOneOnOneId(...mris: string[]): string | undefined {
   const ids = mris.map((mri) => /^8:orgid:([0-9a-f-]{36})$/i.exec(mri)?.[1]?.toLowerCase())
   if (ids.some((id) => !id)) return undefined
   return `19:${(ids as string[]).sort().join('_')}@unq.gbl.spaces`
+}
+
+function mriKind(mri: string): 'org' | 'consumer' | 'other' {
+  const lower = mri.toLowerCase()
+  if (lower.startsWith('8:orgid:')) return 'org'
+  if (lower.startsWith('8:live:')) return 'consumer'
+  return 'other'
+}
+
+function isMixedConsumerOrg(selfMri: string, personMri: string): boolean {
+  const selfKind = mriKind(selfMri)
+  const personKind = mriKind(personMri)
+  return (
+    (selfKind === 'consumer' && personKind === 'org') || (selfKind === 'org' && personKind === 'consumer')
+  )
+}
+
+function oneOnOneThreadProperties(selfMri: string, personMri: string): Record<string, string> {
+  if (isMixedConsumerOrg(selfMri, personMri)) {
+    return {
+      threadType: 'chat',
+      fixedRoster: 'true',
+    }
+  }
+  return {
+    threadType: 'chat',
+    fixedRoster: 'true',
+    uniquerosterthread: 'true',
+  }
 }
 
 export class TeamsClient {
@@ -839,7 +888,7 @@ export class TeamsClient {
         return undefined as T
       }
 
-      const location = response.headers.get('Location')
+      const location = response.headers.get('Location') ?? response.headers.get('Content-Location')
       const text = await response.text()
       if (!text) {
         const threadId = threadIdFromLocation(location)
@@ -1013,7 +1062,8 @@ export class TeamsClient {
   async startOneOnOneChat(person: string): Promise<TeamsStartedChat> {
     const personMri = normalizePersonMri(person, this.getAccountType())
     const keys = personMatchKeys(personMri)
-    const existingId = await this.findExistingOneOnOne(keys)
+    const listed = await this.loadConversations()
+    const existingId = await this.findExistingOneOnOne(keys, listed)
     if (existingId) {
       return { id: existingId, created: false, person: personMri }
     }
@@ -1024,43 +1074,52 @@ export class TeamsClient {
       throw new TeamsError('Cannot start a 1:1 chat with the signed-in account.', 'invalid_person')
     }
 
-    const created = await this.request<{ id?: string; threadId?: string }>('POST', '/threads', {
-      members: [
-        { id: selfMri, role: 'Admin' },
-        { id: personMri, role: 'Admin' },
-      ],
-      properties: {
-        threadType: 'chat',
-        fixedRoster: 'true',
-        uniquerosterthread: 'true',
-      },
-    })
-    const id = created?.id ?? created?.threadId ?? deterministicOrgOneOnOneId(selfMri, personMri)
+    const beforeIds = new Set(listed.map((conv) => conv.id))
+    const members = [
+      { id: selfMri, role: 'Admin' },
+      { id: personMri, role: 'Admin' },
+    ]
+    let created: unknown
+    try {
+      created = await this.request<unknown>('POST', '/threads', {
+        members,
+        properties: oneOnOneThreadProperties(selfMri, personMri),
+      })
+    } catch (error) {
+      if (!isMixedConsumerOrg(selfMri, personMri) || !(error instanceof TeamsError)) {
+        throw error
+      }
+      created = await this.request<unknown>('POST', '/threads', {
+        members,
+        properties: { threadType: 'chat' },
+      })
+    }
+    let id = threadIdFromCreateResponse(created) ?? deterministicOrgOneOnOneId(selfMri, personMri)
+    if (!id) {
+      id = await this.recoverCreatedOneOnOne(beforeIds, keys)
+    }
     if (!id) {
       throw new TeamsError('Thread create did not return a conversation id.', 'thread_id_missing')
     }
     return { id, created: true, person: personMri }
   }
 
-  private async findExistingOneOnOne(keys: string[]): Promise<string | undefined> {
-    interface Conversation {
-      id: string
-      threadProperties?: {
-        topic?: string
-        threadType?: string
-        groupId?: string
-      }
-      lastMessage?: { from?: string }
-      members?: unknown[]
-    }
+  private async loadConversations(): Promise<TeamsRawConversation[]> {
     interface ConversationsResponse {
-      conversations: Conversation[]
+      conversations: TeamsRawConversation[]
     }
     const data = await this.request<ConversationsResponse>(
       'GET',
       '/users/ME/conversations?view=msnp24Equivalent&pageSize=500',
     )
-    for (const conv of data.conversations ?? []) {
+    return data.conversations ?? []
+  }
+
+  private async findExistingOneOnOne(
+    keys: string[],
+    conversations: TeamsRawConversation[],
+  ): Promise<string | undefined> {
+    for (const conv of conversations) {
       if (classifyChat(conv.id, conv.threadProperties) !== 'oneOnOne') continue
       if (
         conversationMatchesPerson(
@@ -1071,7 +1130,65 @@ export class TeamsClient {
         return conv.id
       }
     }
+    for (const conv of conversations) {
+      if (classifyChat(conv.id, conv.threadProperties) !== 'oneOnOne') continue
+      const needsPeek = conv.id.includes('uni01_') || !conv.lastMessage?.from
+      if (!needsPeek) continue
+      if (await this.federatedChatContainsPerson(conv.id, keys)) {
+        return conv.id
+      }
+      if (!conv.lastMessage?.from && (await this.threadMembersIncludePerson(conv.id, keys))) {
+        return conv.id
+      }
+    }
     return undefined
+  }
+
+  private async recoverCreatedOneOnOne(beforeIds: Set<string>, keys: string[]): Promise<string | undefined> {
+    const after = await this.loadConversations()
+    const newcomers = after.filter(
+      (conv) => !beforeIds.has(conv.id) && classifyChat(conv.id, conv.threadProperties) === 'oneOnOne',
+    )
+    const matched = newcomers.filter((conv) =>
+      conversationMatchesPerson(
+        { id: conv.id, members: conv.members, lastMessageFrom: conv.lastMessage?.from },
+        keys,
+      ),
+    )
+    if (matched.length === 1) return matched[0].id
+    if (newcomers.length === 1) return newcomers[0].id
+    for (const conv of newcomers) {
+      if (await this.federatedChatContainsPerson(conv.id, keys)) return conv.id
+      if (await this.threadMembersIncludePerson(conv.id, keys)) return conv.id
+    }
+    return undefined
+  }
+
+  private async federatedChatContainsPerson(chatId: string, keys: string[]): Promise<boolean> {
+    interface ChatMessage {
+      from?: string
+    }
+    interface MessagesResponse {
+      messages: ChatMessage[]
+    }
+    const encodedChatId = encodeURIComponent(chatId)
+    const data = await this.request<MessagesResponse>(
+      'GET',
+      `/users/ME/conversations/${encodedChatId}/messages?startTime=0&view=msnp24Equivalent&pageSize=8`,
+    )
+    return (data.messages ?? []).some((message) =>
+      conversationMatchesPerson({ id: chatId, lastMessageFrom: message.from }, keys),
+    )
+  }
+
+  private async threadMembersIncludePerson(chatId: string, keys: string[]): Promise<boolean> {
+    try {
+      const thread = await this.request<{ members?: unknown[] }>('GET', `/threads/${encodeURIComponent(chatId)}`)
+      return conversationMatchesPerson({ id: chatId, members: thread?.members }, keys)
+    } catch (error) {
+      if (error instanceof TeamsError) return false
+      throw error
+    }
   }
 
   private async getSelfMri(): Promise<string> {
