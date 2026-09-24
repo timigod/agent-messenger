@@ -51,6 +51,11 @@ interface TeamsCookiePath {
   accountTypeKnown: boolean
 }
 
+interface AuthTokenCandidate {
+  bearer: string
+  lastAccessUtc: bigint
+}
+
 const TEAMS_PROCESS_NAMES: Record<string, string> = {
   darwin: 'Microsoft Teams',
   win32: 'Teams.exe',
@@ -58,6 +63,10 @@ const TEAMS_PROCESS_NAMES: Record<string, string> = {
 }
 
 const SKYPETOKEN_COOKIE_NAME = 'skypetoken_asm'
+// Teams can retain multiple partitioned or superseded rows for the same cookie.
+// Keep the candidate set bounded while allowing API validation to reject a stale
+// row and continue to a fresher session from the same desktop profile.
+const MAX_SKYPE_TOKEN_CANDIDATES_PER_DATABASE = 8
 const TEAMS_HOST_PATTERNS = [
   '.asyncgw.teams.microsoft.com',
   '.asm.skype.com',
@@ -71,6 +80,9 @@ const TEAMS_HOST_PATTERNS = [
 // with "Bearer=" and URL-encoded.
 const AUTHTOKEN_COOKIE_NAME = 'authtoken'
 const AUTHTOKEN_HOST_PATTERNS = ['teams.live.com', 'teams.microsoft.com']
+// Bound malformed, duplicate, or superseded rows without allowing token bytes
+// to participate in ordering or tie-breaking.
+const MAX_AUTHTOKEN_ROWS_PER_DATABASE = 8
 
 const TEAMS_KEYCHAIN_VARIANTS: KeychainVariant[] = [
   { service: 'Microsoft Teams Safe Storage', account: 'Microsoft Teams' },
@@ -140,7 +152,7 @@ export class TeamsTokenExtractor {
             'MSTeams',
             'EBWebView',
           )
-        return [
+        const profilePaths: TeamsCookiePath[] = [
           { path: join(ebWebViewBase, 'WV2Profile_tfw', 'Cookies'), accountType: 'work', accountTypeKnown: true },
           {
             path: join(ebWebViewBase, 'WV2Profile_tfw', 'Network', 'Cookies'),
@@ -159,6 +171,10 @@ export class TeamsTokenExtractor {
           },
           { path: join(ebWebViewBase, 'Default', 'Cookies'), accountType: 'work', accountTypeKnown: false },
           { path: join(ebWebViewBase, 'Default', 'Network', 'Cookies'), accountType: 'work', accountTypeKnown: false },
+        ]
+        if (this.desktopProfileRoot) return profilePaths
+        return [
+          ...profilePaths,
           {
             path: join(homedir(), 'Library', 'Application Support', 'Microsoft', 'Teams', 'Cookies'),
             accountType: 'work',
@@ -302,35 +318,74 @@ export class TeamsTokenExtractor {
     const candidatePaths =
       this.tokenSource === 'desktop' ? desktopPaths : [...desktopPaths, ...this.getBrowserCookiesPaths()]
 
+    if (accountType !== undefined) {
+      const knownCandidate = await this.selectNewestAuthToken(candidatePaths.filter((p) => p.accountTypeKnown))
+      if (knownCandidate) return knownCandidate.bearer
+
+      // Unknown-account databases are only a fallback: they cannot override a
+      // valid candidate from the requested account's known desktop profile.
+      const unknownCandidate = await this.selectNewestAuthToken(candidatePaths.filter((p) => !p.accountTypeKnown))
+      return unknownCandidate?.bearer ?? null
+    }
+
+    const newestCandidate = await this.selectNewestAuthToken(candidatePaths)
+    return newestCandidate?.bearer ?? null
+  }
+
+  private async selectNewestAuthToken(candidatePaths: TeamsCookiePath[]): Promise<AuthTokenCandidate | null> {
+    let newestCandidate: AuthTokenCandidate | null = null
+
     for (const { path: dbPath } of candidatePaths) {
       if (!dbPath || !existsSync(dbPath)) continue
 
-      const bearer = await this.extractAuthTokenFromSQLite(dbPath)
-      if (bearer) return bearer
+      const candidates = await this.extractAuthTokenFromSQLite(dbPath)
+      for (const candidate of candidates) {
+        // The SQL row order and candidate-path order are stable tie-breakers.
+        // Keep the earlier candidate when timestamps are equal.
+        if (!newestCandidate || candidate.lastAccessUtc > newestCandidate.lastAccessUtc) {
+          newestCandidate = candidate
+        }
+      }
     }
 
-    return null
+    return newestCandidate
   }
 
-  private async extractAuthTokenFromSQLite(dbPath: string): Promise<string | null> {
+  private async extractAuthTokenFromSQLite(dbPath: string): Promise<AuthTokenCandidate[]> {
     try {
       let localStatePath: string | undefined
       if (this.platform === 'win32') {
         localStatePath = findLocalStatePath(dbPath) ?? undefined
       }
 
-      for (const hostPattern of AUTHTOKEN_HOST_PATTERNS) {
-        const sql = `
-          SELECT value, encrypted_value
-          FROM cookies
-          WHERE name = '${AUTHTOKEN_COOKIE_NAME}'
-          AND host_key LIKE '%${hostPattern}%'
-          LIMIT 1
-        `
+      const hostPredicate = AUTHTOKEN_HOST_PATTERNS.map(() => 'host_key LIKE ?').join(' OR ')
+      const sql = `
+        SELECT value, encrypted_value, CAST(last_access_utc AS TEXT) AS last_access_utc
+        FROM cookies
+        WHERE name = ?
+        AND (${hostPredicate})
+        ORDER BY cookies.last_access_utc DESC, host_key ASC, rowid ASC
+        LIMIT ${MAX_AUTHTOKEN_ROWS_PER_DATABASE + 1}
+      `
+      type CookieRow = {
+        value?: string
+        encrypted_value?: Uint8Array | Buffer
+        last_access_utc?: string | null
+      }
+      const rows = await this.cookieReader.queryAll<CookieRow>(dbPath, sql, [
+        AUTHTOKEN_COOKIE_NAME,
+        ...AUTHTOKEN_HOST_PATTERNS.map((pattern) => `%${pattern}%`),
+      ])
+      if (rows.length > MAX_AUTHTOKEN_ROWS_PER_DATABASE) {
+        this.debug(`    authtoken candidate limit reached; inspecting newest ${MAX_AUTHTOKEN_ROWS_PER_DATABASE} rows`)
+      }
 
-        type CookieRow = { value?: string; encrypted_value?: Uint8Array | Buffer } | null
-        const row = await this.cookieReader.queryFirst<CookieRow>(dbPath, sql)
-        if (!row) continue
+      const candidates: AuthTokenCandidate[] = []
+      for (const row of rows.slice(0, MAX_AUTHTOKEN_ROWS_PER_DATABASE)) {
+        if (!row.last_access_utc || !/^\d+$/.test(row.last_access_utc)) {
+          this.debug(`    rejected authtoken candidate with invalid access timestamp`)
+          continue
+        }
 
         let value = row.value ?? ''
         if ((!value || value.length < 20) && row.encrypted_value && row.encrypted_value.length > 0) {
@@ -340,21 +395,29 @@ export class TeamsTokenExtractor {
         }
 
         const bearer = this.normalizeAuthToken(value)
-        if (bearer) return bearer
+        if (!bearer) {
+          this.debug(`    rejected malformed authtoken candidate`)
+          continue
+        }
+        candidates.push({ bearer, lastAccessUtc: BigInt(row.last_access_utc) })
       }
 
-      return null
+      return candidates
     } catch (error) {
       this.debug(`    authtoken query error: ${(error as Error).message}`)
-      return null
+      return []
     }
   }
 
   private normalizeAuthToken(rawValue: string): string | null {
     if (!rawValue) return null
-    const decoded = decodeURIComponent(rawValue)
-    const token = decoded.replace(/^Bearer=/i, '').trim()
-    return token.length > 20 ? token : null
+    try {
+      const decoded = decodeURIComponent(rawValue)
+      const token = decoded.replace(/^Bearer=/i, '').trim()
+      return token.length > 20 ? token : null
+    } catch {
+      return null
+    }
   }
 
   async clearKeyCache(): Promise<void> {
@@ -367,8 +430,7 @@ export class TeamsTokenExtractor {
 
   private async extractFromCookiesDB(): Promise<ExtractedTeamsToken[]> {
     const results: ExtractedTeamsToken[] = []
-    const seenKnownAccountTypes = new Set<TeamsAccountType>()
-    const seenTokens = new Set<string>()
+    const seenCandidates = new Set<string>()
     const allPaths = this.getTeamsCookiesPaths()
 
     this.debug(`Scanning ${allPaths.length} candidate cookie path(s)`)
@@ -381,34 +443,32 @@ export class TeamsTokenExtractor {
         continue
       }
 
-      if (accountTypeKnown && seenKnownAccountTypes.has(accountType)) {
-        this.debug(`  [skip] ${dbPath} (already have ${accountType} account)`)
-        continue
-      }
-
       const typeLabel = accountTypeKnown ? accountType : `${accountType}?`
       this.debug(`  [try]  ${dbPath} (${typeLabel})`)
 
-      const token = await this.copyAndExtract(dbPath)
-      if (!token || !this.isValidSkypeToken(token)) {
-        if (token) {
-          this.debug(`  [fail] Token too short (${token.length} chars, need >=50)`)
-        } else {
-          this.debug(`  [fail] No token extracted`)
+      const candidates = await this.copyAndExtract(dbPath)
+      if (candidates.length === 0) {
+        this.debug(`  [fail] No valid token candidates extracted`)
+        continue
+      }
+
+      for (const token of candidates) {
+        if (!this.isValidSkypeToken(token)) {
+          this.debug(`  [fail] Rejected malformed token candidate (${token.length} chars)`)
+          continue
         }
-        continue
-      }
 
-      if (seenTokens.has(token)) {
-        this.debug(`  [skip] Duplicate token (already extracted from another path)`)
-        continue
-      }
+        // A token seen in both known desktop profiles must retain each profile's
+        // account label so one profile cannot erase the other before API validation.
+        const dedupeKey = accountTypeKnown ? `${accountType}:${token}` : `unknown:${token}`
+        if (seenCandidates.has(dedupeKey)) {
+          this.debug(`  [skip] Duplicate token candidate (already extracted from another path)`)
+          continue
+        }
 
-      this.debug(`  [ok]   Extracted valid token (${token.length} chars)`)
-      results.push({ token, accountType, accountTypeKnown })
-      seenTokens.add(token)
-      if (accountTypeKnown) {
-        seenKnownAccountTypes.add(accountType)
+        this.debug(`  [ok]   Extracted token candidate (${token.length} chars)`)
+        results.push({ token, accountType, accountTypeKnown })
+        seenCandidates.add(dedupeKey)
       }
     }
 
@@ -416,7 +476,7 @@ export class TeamsTokenExtractor {
     return results
   }
 
-  private async copyAndExtract(dbPath: string): Promise<string | null> {
+  private async copyAndExtract(dbPath: string): Promise<string[]> {
     let tempPath = dbPath
 
     try {
@@ -441,61 +501,65 @@ export class TeamsTokenExtractor {
       return await this.extractFromSQLite(tempPath, localStatePath)
     } catch (error) {
       this.debug(`    Copy/extract error: ${(error as Error).message}`)
-      return null
+      return []
     } finally {
       this.cleanupTempFile(tempPath)
     }
   }
 
-  private async extractFromSQLite(dbPath: string, localStatePath?: string): Promise<string | null> {
+  private async extractFromSQLite(dbPath: string, localStatePath?: string): Promise<string[]> {
     try {
-      for (const hostPattern of TEAMS_HOST_PATTERNS) {
-        const sql = `
-          SELECT value, encrypted_value 
-          FROM cookies 
-          WHERE name = '${SKYPETOKEN_COOKIE_NAME}' 
-          AND host_key LIKE '%${hostPattern}%'
-          LIMIT 1
-        `
+      const hostPredicate = TEAMS_HOST_PATTERNS.map(() => 'host_key LIKE ?').join(' OR ')
+      const sql = `
+        SELECT value, encrypted_value
+        FROM cookies
+        WHERE name = ?
+        AND (${hostPredicate})
+        ORDER BY last_access_utc DESC
+        LIMIT ${MAX_SKYPE_TOKEN_CANDIDATES_PER_DATABASE}
+      `
+      type CookieRow = { value?: string; encrypted_value?: Uint8Array | Buffer }
+      const rows = await this.cookieReader.queryAll<CookieRow>(dbPath, sql, [
+        SKYPETOKEN_COOKIE_NAME,
+        ...TEAMS_HOST_PATTERNS.map((pattern) => `%${pattern}%`),
+      ])
+      const candidates: string[] = []
+      const seen = new Set<string>()
 
-        type CookieRow = { value?: string; encrypted_value?: Uint8Array | Buffer } | null
-
-        const row = await this.cookieReader.queryFirst<CookieRow>(dbPath, sql)
-        if (!row) continue
+      for (const row of rows) {
+        let token = ''
 
         if (row.value && row.value.length >= 50) {
-          this.debug(`    Found plaintext cookie for ${hostPattern} (${row.value.length} chars)`)
-          return row.value
+          this.debug(`    Found plaintext cookie candidate (${row.value.length} chars)`)
+          token = row.value
+        } else if (row.encrypted_value && row.encrypted_value.length > 0) {
+          const encBuf = Buffer.from(row.encrypted_value)
+          const isEncrypted = this.isEncryptedValue(encBuf)
+          this.debug(`    Found encrypted cookie candidate (${encBuf.length} bytes, encrypted=${isEncrypted})`)
+
+          const decryptedBuf = this.decryptor.decryptCookieRaw(encBuf, localStatePath)
+          if (!decryptedBuf) {
+            this.debug(`    Decryption failed`)
+            continue
+          }
+
+          this.debug(`    Decrypted cookie candidate (${decryptedBuf.length} bytes)`)
+          token = this.postProcessDecrypted(decryptedBuf)
         }
 
-        if (!row.encrypted_value || row.encrypted_value.length === 0) {
-          this.debug(`    No cookie data for ${hostPattern}`)
+        if (!this.isValidSkypeToken(token)) {
+          this.debug(`    Rejected malformed cookie candidate (${token.length} chars)`)
           continue
         }
-
-        const encBuf = Buffer.from(row.encrypted_value)
-        const isEncrypted = this.isEncryptedValue(encBuf)
-        this.debug(
-          `    Found cookie for ${hostPattern}: ${encBuf.length} bytes, encrypted=${isEncrypted}, prefix=${encBuf.subarray(0, 3).toString('utf8')}`,
-        )
-
-        const decryptedBuf = this.decryptor.decryptCookieRaw(encBuf, localStatePath)
-        if (!decryptedBuf) {
-          this.debug(`    Decryption failed`)
-          continue
-        }
-
-        this.debug(`    Decrypted: ${decryptedBuf.length} bytes`)
-        const token = this.postProcessDecrypted(decryptedBuf)
-        if (this.isValidSkypeToken(token)) return token
-
-        this.debug(`    Post-process result not a valid token (${token.length} chars)`)
+        if (seen.has(token)) continue
+        candidates.push(token)
+        seen.add(token)
       }
 
-      return null
+      return candidates
     } catch (error) {
       this.debug(`    SQLite query error: ${(error as Error).message}`)
-      return null
+      return []
     }
   }
 

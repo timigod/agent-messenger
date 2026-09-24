@@ -7,7 +7,7 @@ import { TeamsCredentialManager } from '../credential-manager'
 import * as deviceLogin from '../device-login'
 import * as realmDiscovery from '../realm-discovery'
 import { TeamsTokenExtractor } from '../token-extractor'
-import { getNoTeamsTokenFoundMessage, loginAction } from './auth'
+import { extractAction, getNoTeamsTokenFoundMessage, loginAction } from './auth'
 
 let extractorExtractSpy: ReturnType<typeof spyOn>
 let clientTestAuthSpy: ReturnType<typeof spyOn>
@@ -109,6 +109,34 @@ it('desktop-only no-token message does not suggest a browser fallback', () => {
   const message = getNoTeamsTokenFoundMessage('desktop')
   expect(message).toContain('Microsoft Teams desktop app')
   expect(message).not.toContain('Chromium browser')
+})
+
+it('extract: rejects stale same-profile candidates and saves the later validated personal and work sessions', async () => {
+  extractorExtractSpy.mockResolvedValue([
+    { token: 'stale-work-candidate', accountType: 'work', accountTypeKnown: true },
+    { token: 'current-work-candidate', accountType: 'work', accountTypeKnown: true },
+    { token: 'stale-personal-candidate', accountType: 'personal', accountTypeKnown: true },
+    { token: 'current-personal-candidate', accountType: 'personal', accountTypeKnown: true },
+  ])
+  clientTestAuthSpy
+    .mockRejectedValueOnce(new Error('401 Unauthorized'))
+    .mockResolvedValueOnce({ id: 'synthetic-work', displayName: 'Synthetic Work' })
+    .mockRejectedValueOnce(new Error('401 Unauthorized'))
+    .mockResolvedValueOnce({ id: 'synthetic-personal', displayName: 'Synthetic Personal' })
+  clientListTeamsSpy
+    .mockResolvedValueOnce([{ id: 'work-team', name: 'Work Team' }])
+    .mockResolvedValueOnce([{ id: 'personal-chat', name: 'Personal Chat' }])
+  const consoleSpy = spyOn(console, 'log').mockImplementation(() => {})
+
+  await extractAction({ source: 'desktop' })
+
+  expect(clientTestAuthSpy).toHaveBeenCalledTimes(4)
+  expect(credManagerSaveConfigSpy).toHaveBeenCalledTimes(1)
+  const saved = credManagerSaveConfigSpy.mock.calls[0][0]
+  expect(saved.accounts.work.token).toBe('current-work-candidate')
+  expect(saved.accounts.personal.token).toBe('current-personal-candidate')
+  expect(saved.current_account).toBe('work')
+  consoleSpy.mockRestore()
 })
 
 it('login pending hint preserves explicit account type', async () => {

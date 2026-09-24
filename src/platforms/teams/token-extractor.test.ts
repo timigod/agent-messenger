@@ -1,7 +1,10 @@
+import { Database } from 'bun:sqlite'
 import { beforeEach, describe, expect, spyOn, it } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { join } from 'node:path'
+
+import { DerivedKeyCache } from '@/shared/utils/derived-key-cache'
 
 import { TeamsTokenExtractor, resolveTeamsTokenSource } from './token-extractor'
 
@@ -225,15 +228,26 @@ describe('TeamsTokenExtractor', () => {
       expect(desktopOnly.getTeamsCookiesPaths().some((entry) => entry.path.includes('Google/Chrome'))).toBe(false)
     })
 
-    it('can read a companion-staged Teams desktop profile instead of the protected app container', () => {
+    it('reads every bounded companion-staged Teams database without escaping the staged root', () => {
       const stagedRoot = join(tmpdir(), 'teams-bridge-stage')
       const staged = new TeamsTokenExtractor('darwin', undefined, undefined, undefined, 'desktop', stagedRoot)
 
-      expect(staged.getDesktopCookiesPaths()).toContainEqual({
-        path: join(stagedRoot, 'WV2Profile_tfw', 'Network', 'Cookies'),
-        accountType: 'work',
-        accountTypeKnown: true,
-      })
+      expect(staged.getDesktopCookiesPaths()).toEqual([
+        { path: join(stagedRoot, 'WV2Profile_tfw', 'Cookies'), accountType: 'work', accountTypeKnown: true },
+        {
+          path: join(stagedRoot, 'WV2Profile_tfw', 'Network', 'Cookies'),
+          accountType: 'work',
+          accountTypeKnown: true,
+        },
+        { path: join(stagedRoot, 'WV2Profile_tfl', 'Cookies'), accountType: 'personal', accountTypeKnown: true },
+        {
+          path: join(stagedRoot, 'WV2Profile_tfl', 'Network', 'Cookies'),
+          accountType: 'personal',
+          accountTypeKnown: true,
+        },
+        { path: join(stagedRoot, 'Default', 'Cookies'), accountType: 'work', accountTypeKnown: false },
+        { path: join(stagedRoot, 'Default', 'Network', 'Cookies'), accountType: 'work', accountTypeKnown: false },
+      ])
       expect(staged.getLocalStatePath()).toBe(join(stagedRoot, 'Local State'))
     })
   })
@@ -459,7 +473,7 @@ describe('TeamsTokenExtractor', () => {
       const copyAndExtractSpy = spyOn(winExtractor as any, 'copyAndExtract').mockImplementation(async (...args) => {
         const path = args[0] as string
         tried.push(path)
-        return mockToken
+        return [mockToken]
       })
 
       // when
@@ -498,8 +512,8 @@ describe('TeamsTokenExtractor', () => {
       writeFileSync(secondPath, '')
 
       const copyAndExtractSpy = spyOn(winExtractor as any, 'copyAndExtract')
-        .mockResolvedValueOnce(clixmlGarbage)
-        .mockResolvedValueOnce(realToken)
+        .mockResolvedValueOnce([clixmlGarbage])
+        .mockResolvedValueOnce([realToken])
 
       // when
       const results = await (winExtractor as any).extractFromCookiesDB()
@@ -526,7 +540,7 @@ describe('TeamsTokenExtractor', () => {
       const getPathsSpy = spyOn(winExtractor, 'getTeamsCookiesPaths').mockReturnValue([
         { path: browserPath, accountType: 'work', accountTypeKnown: false },
       ])
-      const copyAndExtractSpy = spyOn(winExtractor as any, 'copyAndExtract').mockResolvedValue(mockToken)
+      const copyAndExtractSpy = spyOn(winExtractor as any, 'copyAndExtract').mockResolvedValue([mockToken])
 
       // when
       const results = await (winExtractor as any).extractFromCookiesDB()
@@ -560,8 +574,8 @@ describe('TeamsTokenExtractor', () => {
         { path: browserPath, accountType: 'work', accountTypeKnown: false },
       ])
       const copyAndExtractSpy = spyOn(winExtractor as any, 'copyAndExtract')
-        .mockResolvedValueOnce(desktopToken)
-        .mockResolvedValueOnce(browserToken)
+        .mockResolvedValueOnce([desktopToken])
+        .mockResolvedValueOnce([browserToken])
 
       // when
       const results = await (winExtractor as any).extractFromCookiesDB()
@@ -590,7 +604,7 @@ describe('TeamsTokenExtractor', () => {
         { path: path1, accountType: 'work', accountTypeKnown: false },
         { path: path2, accountType: 'work', accountTypeKnown: false },
       ])
-      const copyAndExtractSpy = spyOn(winExtractor as any, 'copyAndExtract').mockResolvedValue(mockToken)
+      const copyAndExtractSpy = spyOn(winExtractor as any, 'copyAndExtract').mockResolvedValue([mockToken])
 
       // when
       const results = await (winExtractor as any).extractFromCookiesDB()
@@ -598,6 +612,33 @@ describe('TeamsTokenExtractor', () => {
       // then: only one result despite two paths returning the same token
       expect(results).toHaveLength(1)
       expect(results[0].token).toBe(mockToken)
+
+      getPathsSpy.mockRestore()
+      copyAndExtractSpy.mockRestore()
+      cleanup()
+    })
+
+    it('preserves known personal and work labels when the same candidate appears in both profiles', async () => {
+      const workPath = join(workDir, 'WV2Profile_tfw', 'Network', 'Cookies')
+      const personalPath = join(workDir, 'WV2Profile_tfl', 'Network', 'Cookies')
+      mkdirSync(join(workDir, 'WV2Profile_tfw', 'Network'), { recursive: true })
+      mkdirSync(join(workDir, 'WV2Profile_tfl', 'Network'), { recursive: true })
+      writeFileSync(workPath, '')
+      writeFileSync(personalPath, '')
+
+      const desktopExtractor = new TeamsTokenExtractor('darwin')
+      const getPathsSpy = spyOn(desktopExtractor, 'getTeamsCookiesPaths').mockReturnValue([
+        { path: workPath, accountType: 'work', accountTypeKnown: true },
+        { path: personalPath, accountType: 'personal', accountTypeKnown: true },
+      ])
+      const copyAndExtractSpy = spyOn(desktopExtractor as any, 'copyAndExtract').mockResolvedValue([mockToken])
+
+      const results = await (desktopExtractor as any).extractFromCookiesDB()
+
+      expect(results).toEqual([
+        { token: mockToken, accountType: 'work', accountTypeKnown: true },
+        { token: mockToken, accountType: 'personal', accountTypeKnown: true },
+      ])
 
       getPathsSpy.mockRestore()
       copyAndExtractSpy.mockRestore()
@@ -618,7 +659,7 @@ describe('TeamsTokenExtractor', () => {
         { path: workCookies, accountType: 'work', accountTypeKnown: true },
         { path: workNetworkCookies, accountType: 'work', accountTypeKnown: true },
       ])
-      const copyAndExtractSpy = spyOn(winExtractor as any, 'copyAndExtract').mockResolvedValue(mockToken)
+      const copyAndExtractSpy = spyOn(winExtractor as any, 'copyAndExtract').mockResolvedValue([mockToken])
 
       // when
       const results = await (winExtractor as any).extractFromCookiesDB()
@@ -640,7 +681,7 @@ describe('TeamsTokenExtractor', () => {
       const darwinExtractor = new TeamsTokenExtractor('darwin')
 
       const copyFileSpy = spyOn(darwinExtractor as any, 'copyDatabaseToTemp').mockReturnValue('/tmp/test-cookies')
-      const extractSpy = spyOn(darwinExtractor as any, 'extractFromSQLite').mockResolvedValue('test_token')
+      const extractSpy = spyOn(darwinExtractor as any, 'extractFromSQLite').mockResolvedValue(['test_token'])
       const cleanupSpy = spyOn(darwinExtractor as any, 'cleanupTempFile').mockImplementation(() => {})
 
       const result = await (darwinExtractor as any).copyAndExtract('/path/to/Cookies')
@@ -648,14 +689,14 @@ describe('TeamsTokenExtractor', () => {
       expect(copyFileSpy).toHaveBeenCalled()
       expect(extractSpy).toHaveBeenCalled()
       expect(cleanupSpy).toHaveBeenCalled()
-      expect(result).toBe('test_token')
+      expect(result).toEqual(['test_token'])
 
       copyFileSpy.mockRestore()
       extractSpy.mockRestore()
       cleanupSpy.mockRestore()
     })
 
-    it('returns null when copy fails (file locked)', async () => {
+    it('returns no candidates when copy fails (file locked)', async () => {
       const darwinExtractor = new TeamsTokenExtractor('darwin')
 
       const copyFileSpy = spyOn(darwinExtractor as any, 'copyDatabaseToTemp').mockImplementation(() => {
@@ -664,7 +705,7 @@ describe('TeamsTokenExtractor', () => {
 
       const result = await (darwinExtractor as any).copyAndExtract('/path/to/Cookies')
 
-      expect(result).toBeNull()
+      expect(result).toEqual([])
 
       copyFileSpy.mockRestore()
     })
@@ -766,20 +807,291 @@ describe('TeamsTokenExtractor', () => {
   })
 
   describe('SQLite extraction', () => {
-    it('returns null when database path does not exist', async () => {
+    it('selects a newer teams.microsoft.com authtoken over an older teams.live.com row', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-host-order-'))
+      const dbPath = join(root, 'WV2Profile_tfl', 'Cookies')
+      mkdirSync(join(root, 'WV2Profile_tfl'), { recursive: true })
+      const db = new Database(dbPath)
+      db.exec(
+        'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+      )
+      const insert = db.prepare(
+        'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+      )
+      insert.run('authtoken', `Bearer=${'old'.repeat(20)}`, Buffer.alloc(0), 'teams.live.com', 100)
+      insert.run('authtoken', `Bearer=${'new'.repeat(20)}`, Buffer.alloc(0), 'teams.microsoft.com', 200)
+      db.close()
+
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
+
+      expect(token).toBe('new'.repeat(20))
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('selects a newer Network/Cookies authtoken over an older Cookies database row', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-database-order-'))
+      const profileRoot = join(root, 'WV2Profile_tfl')
+      mkdirSync(join(profileRoot, 'Network'), { recursive: true })
+      for (const [dbPath, token, lastAccessUtc] of [
+        [join(profileRoot, 'Cookies'), 'old'.repeat(20), 13_000_000_000_000_000n],
+        [join(profileRoot, 'Network', 'Cookies'), 'new'.repeat(20), 13_000_000_000_000_001n],
+      ] as const) {
+        const db = new Database(dbPath)
+        db.exec(
+          'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+        )
+        db.prepare(
+          'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+        ).run('authtoken', `Bearer=${token}`, Buffer.alloc(0), 'teams.live.com', lastAccessUtc)
+        db.close()
+      }
+
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
+
+      expect(token).toBe('new'.repeat(20))
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('does not let a newer known work profile authtoken override a requested personal account', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-account-filter-'))
+      const workProfile = join(root, 'WV2Profile_tfw')
+      const personalProfile = join(root, 'WV2Profile_tfl')
+      mkdirSync(workProfile, { recursive: true })
+      mkdirSync(personalProfile, { recursive: true })
+      for (const [dbPath, token, lastAccessUtc] of [
+        [join(workProfile, 'Cookies'), 'work'.repeat(20), 300],
+        [join(personalProfile, 'Cookies'), 'personal'.repeat(10), 200],
+      ] as const) {
+        const db = new Database(dbPath)
+        db.exec(
+          'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+        )
+        db.prepare(
+          'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+        ).run('authtoken', `Bearer=${token}`, Buffer.alloc(0), 'teams.live.com', lastAccessUtc)
+        db.close()
+      }
+
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
+
+      expect(token).toBe('personal'.repeat(10))
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('uses an unknown Default database only when no valid requested personal candidate exists', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-unknown-fallback-'))
+      const personalProfile = join(root, 'WV2Profile_tfl')
+      const unknownProfile = join(root, 'Default')
+      mkdirSync(personalProfile, { recursive: true })
+      mkdirSync(unknownProfile, { recursive: true })
+      for (const [dbPath, token, lastAccessUtc] of [
+        [join(personalProfile, 'Cookies'), 'personal'.repeat(10), 200],
+        [join(unknownProfile, 'Cookies'), 'unknown'.repeat(10), 300],
+      ] as const) {
+        const db = new Database(dbPath)
+        db.exec(
+          'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+        )
+        db.prepare(
+          'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+        ).run('authtoken', `Bearer=${token}`, Buffer.alloc(0), 'teams.live.com', lastAccessUtc)
+        db.close()
+      }
+
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
+
+      expect(token).toBe('personal'.repeat(10))
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('reaches a staged Default Network fallback when the requested personal profile has no valid candidate', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-staged-fallback-'))
+      const personalProfile = join(root, 'WV2Profile_tfl')
+      const fallbackProfile = join(root, 'Default', 'Network')
+      mkdirSync(personalProfile, { recursive: true })
+      mkdirSync(fallbackProfile, { recursive: true })
+      for (const [dbPath, value, lastAccessUtc] of [
+        [join(personalProfile, 'Cookies'), 'malformed', 400],
+        [join(fallbackProfile, 'Cookies'), `Bearer=${'fallback'.repeat(10)}`, 300],
+      ] as const) {
+        const db = new Database(dbPath)
+        db.exec(
+          'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+        )
+        db.prepare(
+          'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+        ).run('authtoken', value, Buffer.alloc(0), 'teams.microsoft.com', lastAccessUtc)
+        db.close()
+      }
+
+      const token = await new TeamsTokenExtractor(
+        'darwin',
+        new DerivedKeyCache(join(root, 'key-cache')),
+        undefined,
+        undefined,
+        'desktop',
+        root,
+      ).extractIdToken('personal')
+
+      expect(token).toBe('fallback'.repeat(10))
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('skips malformed authtokens and uses stable non-secret tie-breaking', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-tie-'))
+      const dbPath = join(root, 'Cookies')
+      const db = new Database(dbPath)
+      db.exec(
+        'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+      )
+      const insert = db.prepare(
+        'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+      )
+      insert.run('authtoken', 'Bearer=%E0%A4%A', Buffer.alloc(0), 'teams.live.com', 300)
+      insert.run('authtoken', `Bearer=${'live'.repeat(20)}`, Buffer.alloc(0), 'teams.live.com', 200)
+      insert.run('authtoken', `Bearer=${'microsoft'.repeat(10)}`, Buffer.alloc(0), 'teams.microsoft.com', 200)
+      db.close()
+
+      const candidates = await (new TeamsTokenExtractor('darwin') as any).extractAuthTokenFromSQLite(dbPath)
+
+      expect(candidates.map((candidate: { bearer: string }) => candidate.bearer)).toEqual([
+        'live'.repeat(20),
+        'microsoft'.repeat(10),
+      ])
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('bounds authtoken candidates and keeps diagnostics secret-free', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-authtoken-bound-'))
+      const dbPath = join(root, 'Cookies')
+      const db = new Database(dbPath)
+      db.exec(
+        'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+      )
+      const insert = db.prepare(
+        'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+      )
+      for (let index = 0; index < 10; index += 1) {
+        insert.run(
+          'authtoken',
+          `Bearer=candidate_${String(index).padStart(2, '0')}_${'x'.repeat(40)}`,
+          Buffer.alloc(0),
+          index % 2 === 0 ? 'teams.live.com' : 'teams.microsoft.com',
+          1_000 - index,
+        )
+      }
+      db.close()
+
+      const debugLines: string[] = []
+      const candidates = await (
+        new TeamsTokenExtractor('darwin', undefined, (line) => debugLines.push(line)) as any
+      ).extractAuthTokenFromSQLite(dbPath)
+
+      expect(candidates).toHaveLength(8)
+      expect(debugLines).toContain('    authtoken candidate limit reached; inspecting newest 8 rows')
+      expect(debugLines.join('\n')).not.toContain('candidate_')
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('returns same-profile candidates newest-first so API validation can reject a stale row', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-cookie-candidates-'))
+      const dbPath = join(root, 'Cookies')
+      const staleToken = `stale_${'a'.repeat(70)}`
+      const currentToken = `current_${'b'.repeat(70)}`
+      const db = new Database(dbPath)
+      db.exec(
+        'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+      )
+      const insert = db.prepare(
+        'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+      )
+      insert.run('skypetoken_asm', staleToken, Buffer.alloc(0), '.asm.skype.com', 100)
+      insert.run('skypetoken_asm', currentToken, Buffer.alloc(0), '.asm.skype.com', 200)
+      db.close()
+
+      const debugLines: string[] = []
+      const candidateExtractor = new TeamsTokenExtractor('darwin', undefined, (line) => debugLines.push(line))
+      const candidates = await (candidateExtractor as any).extractFromSQLite(dbPath)
+
+      expect(candidates).toEqual([currentToken, staleToken])
+      expect(debugLines.join('\n')).not.toContain(currentToken)
+      expect(debugLines.join('\n')).not.toContain(staleToken)
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('rejects malformed nearby rows and bounds the candidate set', async () => {
+      const root = mkdtempSync(join(tmpdir(), 'teams-cookie-bound-'))
+      const dbPath = join(root, 'Cookies')
+      const db = new Database(dbPath)
+      db.exec(
+        'CREATE TABLE cookies (name TEXT, value TEXT, encrypted_value BLOB, host_key TEXT, last_access_utc INTEGER)',
+      )
+      const insert = db.prepare(
+        'INSERT INTO cookies (name, value, encrypted_value, host_key, last_access_utc) VALUES (?, ?, ?, ?, ?)',
+      )
+      insert.run('skypetoken_asm', `malformed ${'x'.repeat(70)}`, Buffer.alloc(0), '.asm.skype.com', 1_000)
+      for (let index = 0; index < 9; index += 1) {
+        insert.run(
+          'skypetoken_asm',
+          `candidate_${String(index).padStart(2, '0')}_${'c'.repeat(60)}`,
+          Buffer.alloc(0),
+          '.asm.skype.com',
+          900 - index,
+        )
+      }
+      db.close()
+
+      const candidates = await (new TeamsTokenExtractor('darwin') as any).extractFromSQLite(dbPath)
+
+      expect(candidates).toHaveLength(7)
+      expect(candidates[0]).toStartWith('candidate_00_')
+      expect(candidates.at(-1)).toStartWith('candidate_06_')
+      expect(candidates.some((candidate: string) => candidate.includes('malformed'))).toBe(false)
+      rmSync(root, { recursive: true, force: true })
+    })
+
+    it('returns no candidates when database path does not exist', async () => {
       const darwinExtractor = new TeamsTokenExtractor('darwin')
 
       const result = await (darwinExtractor as any).extractFromSQLite('/nonexistent/path')
 
-      expect(result).toBeNull()
+      expect(result).toEqual([])
     })
 
-    it('returns null when extraction throws', async () => {
+    it('returns no candidates when extraction throws', async () => {
       const darwinExtractor = new TeamsTokenExtractor('darwin')
 
       const result = await (darwinExtractor as any).extractFromSQLite('/dev/null')
 
-      expect(result).toBeNull()
+      expect(result).toEqual([])
     })
   })
 })
