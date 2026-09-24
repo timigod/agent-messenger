@@ -159,19 +159,20 @@ export class TeamsTokenExtractor {
             accountType: 'work',
             accountTypeKnown: true,
           },
-          {
-            path: join(ebWebViewBase, 'WV2Profile_tfl', 'Cookies'),
-            accountType: 'personal',
-            accountTypeKnown: true,
-          },
-          {
-            path: join(ebWebViewBase, 'WV2Profile_tfl', 'Network', 'Cookies'),
-            accountType: 'personal',
-            accountTypeKnown: true,
-          },
           { path: join(ebWebViewBase, 'Default', 'Cookies'), accountType: 'work', accountTypeKnown: false },
           { path: join(ebWebViewBase, 'Default', 'Network', 'Cookies'), accountType: 'work', accountTypeKnown: false },
         ]
+        // The signed bridge stages only the profiles that exist. A work-only
+        // macOS user has no WV2Profile_tfl; keep that optional profile out of
+        // the staged extractor's candidate set while retaining it for normal
+        // live Teams installs where it may be present.
+        const personalProfileRoot = join(ebWebViewBase, 'WV2Profile_tfl')
+        if (!this.desktopProfileRoot || existsSync(personalProfileRoot)) {
+          profilePaths.splice(2, 0,
+            { path: join(personalProfileRoot, 'Cookies'), accountType: 'personal', accountTypeKnown: true },
+            { path: join(personalProfileRoot, 'Network', 'Cookies'), accountType: 'personal', accountTypeKnown: true },
+          )
+        }
         if (this.desktopProfileRoot) return profilePaths
         return [
           ...profilePaths,

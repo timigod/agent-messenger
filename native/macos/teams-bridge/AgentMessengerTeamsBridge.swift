@@ -556,7 +556,9 @@ private func snapshotSQLiteDatabase(_ source: URL, to destination: URL) throws {
 
 private let teamsProfileDatabaseLayout: [(profile: String, required: Bool)] = [
     ("WV2Profile_tfw", true),
-    ("WV2Profile_tfl", true),
+    // A work-only macOS user has no personal Teams profile. The extractor can
+    // still use the work profile and Default fallback in that case.
+    ("WV2Profile_tfl", false),
     ("Default", false),
 ]
 
@@ -965,6 +967,18 @@ private func runSelfTest() throws {
         guard try readSelfTestMarker(staged) == marker else {
             throw BridgeError.invalidRequest("A staged synthetic Teams database lost committed WAL state.")
         }
+    }
+
+    let workOnlySource = testRoot.appendingPathComponent("work-only-profiles", isDirectory: true)
+    let workOnlyStage = testRoot.appendingPathComponent("work-only-staged", isDirectory: true)
+    let workOnlyDatabase = workOnlySource.appendingPathComponent("WV2Profile_tfw/Cookies", isDirectory: false)
+    let workOnlyHandle = try openSelfTestDatabase(workOnlyDatabase, marker: 401)
+    defer { sqlite3_close(workOnlyHandle) }
+    try snapshotTeamsProfileDatabases(sourceRoot: workOnlySource, destinationRoot: workOnlyStage)
+    guard FileManager.default.fileExists(atPath: workOnlyDatabase.path),
+          FileManager.default.fileExists(atPath: workOnlyStage.appendingPathComponent("WV2Profile_tfw/Cookies").path),
+          !FileManager.default.fileExists(atPath: workOnlyStage.appendingPathComponent("WV2Profile_tfl").path) else {
+        throw BridgeError.invalidRequest("A work-only Teams profile should not require or create WV2Profile_tfl.")
     }
     let upload = BridgeRequest(
         version: 1,

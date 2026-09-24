@@ -229,26 +229,47 @@ describe('TeamsTokenExtractor', () => {
     })
 
     it('reads every bounded companion-staged Teams database without escaping the staged root', () => {
-      const stagedRoot = join(tmpdir(), 'teams-bridge-stage')
-      const staged = new TeamsTokenExtractor('darwin', undefined, undefined, undefined, 'desktop', stagedRoot)
+      const stagedRoot = mkdtempSync(join(tmpdir(), 'teams-bridge-stage-'))
+      mkdirSync(join(stagedRoot, 'WV2Profile_tfl'), { recursive: true })
+      try {
+        const staged = new TeamsTokenExtractor('darwin', undefined, undefined, undefined, 'desktop', stagedRoot)
 
-      expect(staged.getDesktopCookiesPaths()).toEqual([
-        { path: join(stagedRoot, 'WV2Profile_tfw', 'Cookies'), accountType: 'work', accountTypeKnown: true },
-        {
-          path: join(stagedRoot, 'WV2Profile_tfw', 'Network', 'Cookies'),
-          accountType: 'work',
-          accountTypeKnown: true,
-        },
-        { path: join(stagedRoot, 'WV2Profile_tfl', 'Cookies'), accountType: 'personal', accountTypeKnown: true },
-        {
-          path: join(stagedRoot, 'WV2Profile_tfl', 'Network', 'Cookies'),
-          accountType: 'personal',
-          accountTypeKnown: true,
-        },
-        { path: join(stagedRoot, 'Default', 'Cookies'), accountType: 'work', accountTypeKnown: false },
-        { path: join(stagedRoot, 'Default', 'Network', 'Cookies'), accountType: 'work', accountTypeKnown: false },
-      ])
-      expect(staged.getLocalStatePath()).toBe(join(stagedRoot, 'Local State'))
+        expect(staged.getDesktopCookiesPaths()).toEqual([
+          { path: join(stagedRoot, 'WV2Profile_tfw', 'Cookies'), accountType: 'work', accountTypeKnown: true },
+          {
+            path: join(stagedRoot, 'WV2Profile_tfw', 'Network', 'Cookies'),
+            accountType: 'work',
+            accountTypeKnown: true,
+          },
+          { path: join(stagedRoot, 'WV2Profile_tfl', 'Cookies'), accountType: 'personal', accountTypeKnown: true },
+          {
+            path: join(stagedRoot, 'WV2Profile_tfl', 'Network', 'Cookies'),
+            accountType: 'personal',
+            accountTypeKnown: true,
+          },
+          { path: join(stagedRoot, 'Default', 'Cookies'), accountType: 'work', accountTypeKnown: false },
+          { path: join(stagedRoot, 'Default', 'Network', 'Cookies'), accountType: 'work', accountTypeKnown: false },
+        ])
+        expect(staged.getLocalStatePath()).toBe(join(stagedRoot, 'Local State'))
+      } finally {
+        rmSync(stagedRoot, { recursive: true, force: true })
+      }
+    })
+
+    it('does not require a personal profile for a work-only staged macOS bridge', () => {
+      const stagedRoot = mkdtempSync(join(tmpdir(), 'teams-bridge-work-only-stage-'))
+      mkdirSync(join(stagedRoot, 'WV2Profile_tfw'), { recursive: true })
+      try {
+        const staged = new TeamsTokenExtractor('darwin', undefined, undefined, undefined, 'desktop', stagedRoot)
+        expect(staged.getDesktopCookiesPaths().map((entry) => entry.path)).toEqual([
+          join(stagedRoot, 'WV2Profile_tfw', 'Cookies'),
+          join(stagedRoot, 'WV2Profile_tfw', 'Network', 'Cookies'),
+          join(stagedRoot, 'Default', 'Cookies'),
+          join(stagedRoot, 'Default', 'Network', 'Cookies'),
+        ])
+      } finally {
+        rmSync(stagedRoot, { recursive: true, force: true })
+      }
     })
   })
 
