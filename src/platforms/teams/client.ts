@@ -595,6 +595,13 @@ function memberId(value: unknown): string | undefined {
   return undefined
 }
 
+function membersIncludePerson(members: unknown[] | undefined, keys: string[]): boolean {
+  return (members ?? []).some((member) => {
+    const id = memberId(member)
+    return id !== undefined && personMatchKeys(id).some((key) => keys.includes(key))
+  })
+}
+
 function conversationMatchesPerson(
   conversation: { id: string; members?: unknown[]; lastMessageFrom?: string },
   keys: string[],
@@ -1179,7 +1186,8 @@ export class TeamsClient {
         conversationMatchesPerson(
           { id: conv.id, members: conv.members, lastMessageFrom: conv.lastMessage?.from },
           keys,
-        )
+        ) &&
+        (await this.conversationMembersIncludePerson(conv, keys))
       ) {
         return conv.id
       }
@@ -1188,10 +1196,13 @@ export class TeamsClient {
       if (classifyChat(conv.id, conv.threadProperties) !== 'oneOnOne') continue
       const needsPeek = conv.id.includes('uni01_') || !conv.lastMessage?.from
       if (!needsPeek) continue
-      if (await this.federatedChatContainsPerson(conv.id, keys)) {
+      if (
+        (await this.federatedChatContainsPerson(conv.id, keys)) &&
+        (await this.conversationMembersIncludePerson(conv, keys))
+      ) {
         return conv.id
       }
-      if (!conv.lastMessage?.from && (await this.threadMembersIncludePerson(conv.id, keys))) {
+      if (!conv.lastMessage?.from && (await this.conversationMembersIncludePerson(conv, keys))) {
         return conv.id
       }
     }
@@ -1203,19 +1214,15 @@ export class TeamsClient {
     const newcomers = after.filter(
       (conv) => !beforeIds.has(conv.id) && classifyChat(conv.id, conv.threadProperties) === 'oneOnOne',
     )
-    const matched = newcomers.filter((conv) =>
-      conversationMatchesPerson(
-        { id: conv.id, members: conv.members, lastMessageFrom: conv.lastMessage?.from },
-        keys,
-      ),
-    )
-    if (matched.length === 1) return matched[0].id
-    if (newcomers.length === 1) return newcomers[0].id
     for (const conv of newcomers) {
-      if (await this.federatedChatContainsPerson(conv.id, keys)) return conv.id
-      if (await this.threadMembersIncludePerson(conv.id, keys)) return conv.id
+      if (await this.conversationMembersIncludePerson(conv, keys)) return conv.id
     }
     return undefined
+  }
+
+  private async conversationMembersIncludePerson(conv: TeamsRawConversation, keys: string[]): Promise<boolean> {
+    if (membersIncludePerson(conv.members, keys)) return true
+    return this.threadMembersIncludePerson(conv.id, keys)
   }
 
   private async federatedChatContainsPerson(chatId: string, keys: string[]): Promise<boolean> {
@@ -1238,7 +1245,7 @@ export class TeamsClient {
   private async threadMembersIncludePerson(chatId: string, keys: string[]): Promise<boolean> {
     try {
       const thread = await this.request<{ members?: unknown[] }>('GET', `/threads/${encodeURIComponent(chatId)}`)
-      return conversationMatchesPerson({ id: chatId, members: thread?.members }, keys)
+      return membersIncludePerson(thread?.members, keys)
     } catch (error) {
       if (error instanceof TeamsError) return false
       throw error

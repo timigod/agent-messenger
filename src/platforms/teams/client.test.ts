@@ -1375,19 +1375,36 @@ describe('TeamsClient', () => {
       mockResponse({
         conversations: [
           { id: '19:group@thread.tacv2', threadProperties: { topic: 'Group Chat', threadType: 'chat' } },
-          { id: existingId, lastMessage: { content: 'Hi' } },
+          { id: existingId, lastMessage: { content: 'Hi', from: `8:orgid:${personGuid}` } },
         ],
       })
+      mockResponse({ members: [{ id: `8:orgid:${personGuid}` }, { id: `8:orgid:${selfGuid}` }] })
 
       const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
       const chat = await client.startOneOnOneChat(`8:orgid:${personGuid}`)
 
       expect(chat).toEqual({ id: existingId, created: false, person: `8:orgid:${personGuid}` })
-      expect(fetchCalls).toHaveLength(1)
+      expect(fetchCalls).toHaveLength(2)
       expect(fetchCalls[0].url).toContain('/users/ME/conversations')
+      expect(fetchCalls[1].url).toContain(`/threads/${encodeURIComponent(existingId)}`)
       expect(fetchCalls.some((call) => String(call.url).includes('/v1/threads') && call.options?.method === 'POST')).toBe(
         false,
       )
+    })
+
+    it('does not trust a matching conversation id when its members omit the person', async () => {
+      mockResponse({
+        conversations: [{ id: existingId, lastMessage: { content: 'Hi', from: `8:orgid:${personGuid}` } }],
+      })
+      mockResponse({ members: [{ id: `8:orgid:${selfGuid}` }] })
+      mockResponse({ primaryMemberName: `8:orgid:${selfGuid}` })
+      mockResponse({ id: createdId })
+
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      const chat = await client.startOneOnOneChat(`8:orgid:${personGuid}`)
+
+      expect(chat).toEqual({ id: createdId, created: true, person: `8:orgid:${personGuid}` })
+      expect(fetchCalls[1].url).toContain(`/threads/${encodeURIComponent(existingId)}`)
     })
 
     it('returns an existing 1:1 whose members include the person', async () => {
@@ -1481,6 +1498,32 @@ describe('TeamsClient', () => {
 
       expect(chat.id).toBe(`19:${selfGuid}_${personGuid}@unq.gbl.spaces`)
       expect(chat.created).toBe(true)
+    })
+
+    it('recovers a created chat only when its members include the person', async () => {
+      const opaquePerson = '8:orgid:opaque-person'
+      mockResponse({ conversations: [] })
+      mockResponse({ primaryMemberName: `8:orgid:${selfGuid}` })
+      fetchResponses.push(new Response(null, { status: 201 }))
+      mockResponse({ conversations: [{ id: createdId }] })
+      mockResponse({ members: [{ id: opaquePerson }, { id: `8:orgid:${selfGuid}` }] })
+
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      const chat = await client.startOneOnOneChat(opaquePerson)
+
+      expect(chat).toEqual({ id: createdId, created: true, person: opaquePerson })
+    })
+
+    it('does not recover a sole new chat when its members omit the person', async () => {
+      const opaquePerson = '8:orgid:opaque-person'
+      mockResponse({ conversations: [] })
+      mockResponse({ primaryMemberName: `8:orgid:${selfGuid}` })
+      fetchResponses.push(new Response(null, { status: 201 }))
+      mockResponse({ conversations: [{ id: createdId }] })
+      mockResponse({ members: [{ id: `8:orgid:${selfGuid}` }] })
+
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      await expect(client.startOneOnOneChat(opaquePerson)).rejects.toThrow('conversation id')
     })
 
     it('creates a personal 1:1 with 8:live: members on the consumer host', async () => {
