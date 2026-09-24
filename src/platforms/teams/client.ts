@@ -41,6 +41,7 @@ type JsonRecord = Record<string, unknown>
 
 const PERSONAL_MSG_API_BASE = 'https://msgapi.teams.live.com/v1'
 const CSA_API_BASE = 'https://teams.microsoft.com/api'
+const MIDDLE_TIER_API_BASE = 'https://teams.microsoft.com/api/mt'
 const MAX_RETRIES = 3
 const BASE_BACKOFF_MS = 100
 const DEFAULT_REGION: TeamsRegion = 'amer'
@@ -323,6 +324,24 @@ function recordFrom(record: JsonRecord, keys: string[]): JsonRecord | undefined 
   for (const key of keys) {
     const value = record[key]
     if (isRecord(value)) return value
+  }
+  return undefined
+}
+
+function shortProfileMri(value: unknown): string | undefined {
+  const candidates: unknown[] = [value]
+  if (Array.isArray(value)) candidates.push(...value)
+  if (isRecord(value)) {
+    for (const key of ['profile', 'Profile', 'user', 'User', 'result', 'Result', 'value', 'Value']) {
+      const nested = value[key]
+      candidates.push(nested)
+      if (Array.isArray(nested)) candidates.push(...nested)
+    }
+  }
+  for (const candidate of candidates) {
+    if (!isRecord(candidate)) continue
+    const mri = stringFrom(candidate, ['mri', 'MRI', 'userMri', 'userMRI', 'skypeid', 'skypeId', 'id', 'Id'])
+    if (mri) return mri
   }
   return undefined
 }
@@ -730,6 +749,41 @@ export class TeamsClient {
     const tokenSource = resolveTeamsTokenSource(process.env.AGENT_TEAMS_AUTH_SOURCE)
     const extractor = new TeamsTokenExtractor(undefined, undefined, undefined, undefined, tokenSource)
     return extractor.extractIdToken(this.getAccountType())
+  }
+
+  async lookupMriByEmail(email: string): Promise<string> {
+    const normalizedEmail = email.trim()
+    if (!normalizedEmail || !normalizedEmail.includes('@')) {
+      throw new TeamsError('A valid email address is required.', 'invalid_email')
+    }
+
+    const authtoken = await this.getIdToken()
+    if (!authtoken) {
+      throw new TeamsError('No Teams authtoken found. Run "auth extract" while Teams is signed in.', 'no_authtoken')
+    }
+
+    const response = await fetch(
+      `${MIDDLE_TIER_API_BASE}/${this.region}/beta/users/fetchShortProfile?isMailAddress=true`,
+      {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${authtoken}`,
+        'Content-Type': 'application/json',
+      },
+        body: JSON.stringify([normalizedEmail]),
+      },
+    )
+    const data = (await response.json().catch(() => null)) as unknown
+    if (!response.ok) {
+      const message = isRecord(data) ? stringFrom(data, ['message', 'Message', 'error', 'error_description']) : undefined
+      throw new TeamsError(message ?? `HTTP ${response.status}`, `short_profile_${response.status}`)
+    }
+
+    const mri = shortProfileMri(data)
+    if (!mri) {
+      throw new TeamsError('Teams did not return an MRI for that email address.', 'short_profile_missing_mri')
+    }
+    return mri
   }
 
   private ensureAuth(): string {

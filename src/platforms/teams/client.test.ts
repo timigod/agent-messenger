@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test'
 import { rmSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -140,6 +140,32 @@ describe('TeamsClient', () => {
       const expiresAt = new Date(Date.now() + 3600000).toISOString()
       const client = await new TeamsClient().login({ token: 'test-token', tokenExpiresAt: expiresAt, region: 'emea' })
       expect(client).toBeInstanceOf(TeamsClient)
+    })
+  })
+
+  describe('lookupMriByEmail', () => {
+    it('uses the extracted authtoken with the Teams short-profile endpoint', async () => {
+      mockResponse({ profile: { mri: '8:orgid:11111111-1111-1111-1111-111111111111' } })
+      const client = await new TeamsClient().login({ token: 'skype-token', accountType: 'work', region: 'emea' })
+      spyOn(client, 'getIdToken').mockResolvedValue('authtoken-from-cookie')
+
+      const mri = await client.lookupMriByEmail('recipient@example.com')
+
+      expect(mri).toBe('8:orgid:11111111-1111-1111-1111-111111111111')
+      expect(fetchCalls[0].url).toBe(
+        'https://teams.microsoft.com/api/mt/emea/beta/users/fetchShortProfile?isMailAddress=true',
+      )
+      expect(fetchCalls[0].options?.method).toBe('POST')
+      expect(headerValue(fetchCalls[0].options, 'Authorization')).toBe('Bearer authtoken-from-cookie')
+      expect(JSON.parse(String(fetchCalls[0].options?.body))).toEqual(['recipient@example.com'])
+    })
+
+    it('rejects a response without an MRI', async () => {
+      mockResponse({ profile: { displayName: 'No MRI' } })
+      const client = await new TeamsClient().login({ token: 'skype-token', accountType: 'work', region: 'emea' })
+      spyOn(client, 'getIdToken').mockResolvedValue('authtoken-from-cookie')
+
+      await expect(client.lookupMriByEmail('recipient@example.com')).rejects.toThrow('did not return an MRI')
     })
   })
 

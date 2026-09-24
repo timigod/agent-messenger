@@ -99,6 +99,29 @@ async function meAction(options: { pretty?: boolean }): Promise<void> {
   }
 }
 
+async function lookupEmailAction(email: string, options: { pretty?: boolean }): Promise<void> {
+  try {
+    const credManager = new TeamsCredentialManager()
+    const cred = await credManager.getTokenWithExpiry()
+
+    if (!cred) {
+      console.log(formatOutput({ error: 'Not authenticated. Run "auth extract" first.' }, options.pretty))
+      process.exit(1)
+    }
+
+    const client = await new TeamsClient().login({
+      token: cred.token,
+      tokenExpiresAt: cred.tokenExpiresAt,
+      accountType: cred.accountType,
+      region: cred.region,
+    })
+    const mri = await client.lookupMriByEmail(email)
+    console.log(formatOutput({ email, mri }, options.pretty))
+  } catch (error) {
+    handleError(error as Error)
+  }
+}
+
 export const userCommand = new Command('user')
   .description('User commands')
   .addCommand(
@@ -120,4 +143,11 @@ export const userCommand = new Command('user')
       .description('Show current authenticated user')
       .option('--pretty', 'Pretty print JSON output')
       .action(meAction),
+  )
+  .addCommand(
+    new Command('lookup-email')
+      .description('Resolve an email address to a Teams MRI')
+      .argument('<email>', 'Email address')
+      .option('--pretty', 'Pretty print JSON output')
+      .action(lookupEmailAction),
   )
