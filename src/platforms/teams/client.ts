@@ -596,9 +596,11 @@ function memberId(value: unknown): string | undefined {
 }
 
 function membersIncludePerson(members: unknown[] | undefined, keys: string[]): boolean {
+  const expectedMri = keys[0]?.replace(/^8:/i, '').toLowerCase()
+  if (!expectedMri) return false
   return (members ?? []).some((member) => {
     const id = memberId(member)
-    return id !== undefined && personMatchKeys(id).some((key) => keys.includes(key))
+    return id?.trim().replace(/^8:/i, '').toLowerCase() === expectedMri
   })
 }
 

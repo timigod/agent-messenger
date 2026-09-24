@@ -1407,6 +1407,20 @@ describe('TeamsClient', () => {
       expect(fetchCalls[1].url).toContain(`/threads/${encodeURIComponent(existingId)}`)
     })
 
+    it('does not confuse a consumer MRI with the requested org MRI', async () => {
+      mockResponse({
+        conversations: [{ id: existingId, lastMessage: { from: `8:orgid:${personGuid}` }, members: [{ id: `8:live:${personGuid}` }] }],
+      })
+      mockResponse({ members: [{ id: `8:live:${personGuid}` }] })
+      mockResponse({ primaryMemberName: `8:orgid:${selfGuid}` })
+      mockResponse({ id: createdId })
+
+      const client = await new TeamsClient().login({ token: 'test-token', region: 'emea' })
+      const chat = await client.startOneOnOneChat(`8:orgid:${personGuid}`)
+
+      expect(chat).toEqual({ id: createdId, created: true, person: `8:orgid:${personGuid}` })
+    })
+
     it('returns an existing 1:1 whose members include the person', async () => {
       mockResponse({
         conversations: [
